@@ -10097,6 +10097,20 @@ class Scheduler:
         request.generation_prompt_start = 0
         self._resolve_generation_prompt_start(request)
         request.remaining_tokens = original_prompt[cached_tokens:]
+        # A splice kept at lookup leaves a paged table whose blocks past p0
+        # are hashed on the spliced ids. The finish-time store extends that
+        # table, so keeping it would chain the canonical prompt's KV under
+        # spliced parent hashes. Drop it; the store rebuilds from scratch.
+        paged = getattr(self, "paged_cache_manager", None)
+        table = (
+            paged.get_block_table(request.request_id) if paged is not None else None
+        )
+        if table is not None and getattr(table, "num_tokens", 0) > cached_tokens:
+            Scheduler._release_paged_cache_for_request(self, request.request_id)
+            if paged.get_block_table(request.request_id) is not None:
+                paged.delete_block_table(request.request_id)
+            request.block_table = None
+            request.shared_prefix_blocks = 0
         logger.info(
             "prefix splice: request %s reverted (cached %d <= first divergence %d)",
             request.request_id,

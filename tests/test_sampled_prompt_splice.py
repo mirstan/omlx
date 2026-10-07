@@ -775,6 +775,96 @@ class TestLookupRevertsUnbackedSplice:
         assert req.cached_tokens == 128
 
 
+class _PagedTables:
+    """Fake paged-cache manager: the per-request tables ``store_cache`` reads."""
+
+    def __init__(self):
+        self.tables = {}
+
+    def get_block_table(self, request_id):
+        return self.tables.get(request_id)
+
+    def delete_block_table(self, request_id):
+        self.tables.pop(request_id, None)
+
+
+class _TrackingFetchCache(_FetchCache):
+    """Records each fetched table where the finish-time store would find it."""
+
+    def __init__(self, num_tokens, paged, **kwargs):
+        super().__init__(num_tokens, **kwargs)
+        self.paged = paged
+
+    def fetch_cache(self, request_id, tokens, **kwargs):
+        table, remaining = super().fetch_cache(request_id, tokens, **kwargs)
+        if table is not None:
+            self.paged.tables[request_id] = table
+        return table, remaining
+
+    def release_cache(self, request_id):
+        self.paged.delete_block_table(request_id)
+
+
+def _make_tracking_scheduler(num_tokens):
+    sched = _make_lookup_scheduler(num_tokens)
+    paged = _PagedTables()
+    sched.block_aware_cache = _TrackingFetchCache(num_tokens, paged)
+    sched.paged_cache_manager = paged
+    return sched, paged
+
+
+class TestRevertDropsSplicedBlockTable:
+    """A revert after a kept splice must not leave the spliced table behind.
+
+    The finish-time store extends ``paged.get_block_table(request_id)``; a
+    table hashed on spliced ids past the first divergence would chain the
+    canonical prompt's KV under spliced parent hashes.
+    """
+
+    def test_rejected_cache_drops_spliced_table(self):
+        sched, paged = _make_tracking_scheduler(128)
+        req = _spliced_request(sched)
+        sched._prepare_prefix_cache_for_request(req)
+        assert paged.get_block_table(req.request_id).num_tokens == 128
+
+        sched._reject_invalid_prompt_cache(req)
+
+        _assert_canonical(req, 0)
+        assert paged.get_block_table(req.request_id) is None
+        assert req.block_table is None
+        assert req.shared_prefix_blocks == 0
+
+    def test_reprefill_drops_spliced_table(self):
+        sched, paged = _make_tracking_scheduler(128)
+        req = _spliced_request(sched)
+        sched._prepare_prefix_cache_for_request(req)
+
+        sched._reset_request_for_reprefill(req)
+
+        _assert_canonical(req, 0)
+        assert paged.get_block_table(req.request_id) is None
+
+    def test_lookup_revert_keeps_shared_prefix_table(self):
+        # Reused 64 <= first divergence 100: the table covers only tokens
+        # both prompts share, so it stays valid for the canonical prompt.
+        sched, paged = _make_tracking_scheduler(64)
+        req = _spliced_request(sched)
+
+        sched._prepare_prefix_cache_for_request(req)
+
+        _assert_canonical(req, 64)
+        assert paged.get_block_table(req.request_id).num_tokens == 64
+
+    def test_kept_splice_keeps_table(self):
+        sched, paged = _make_tracking_scheduler(128)
+        req = _spliced_request(sched)
+
+        sched._prepare_prefix_cache_for_request(req)
+
+        assert req.prompt_token_ids == SPLICED + GEN
+        assert paged.get_block_table(req.request_id).num_tokens == 128
+
+
 class TestSpliceRecordClearedOnFinish:
     def _scheduler(self, mock_model, mock_tokenizer):
         sched = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
