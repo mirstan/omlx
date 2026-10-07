@@ -2193,9 +2193,12 @@ class Scheduler:
         # DEBUG-only prefix-cache divergence probe (issue #1003): recent
         # stored cache sequences, so a miss can be traced to the exact
         # token where the new prompt diverges from what was cached.
-        # Always maintained (int32 arrays, maxlen=4) so large re-prefills
-        # can log their divergence point at INFO (#2333).
-        self._cache_probe_seqs: deque[tuple[str, array | list[int]]] = deque(maxlen=4)
+        # Always maintained (int32 arrays, maxlen=_CACHE_PROBE_MAXLEN) so
+        # large re-prefills can log their divergence point at INFO (#2333)
+        # and re-sent sampled output can be spliced back (add_request).
+        self._cache_probe_seqs: deque[tuple[str, array | list[int]]] = deque(
+            maxlen=self._CACHE_PROBE_MAXLEN
+        )
 
         # Hybrid models whose recurrent state is REBOUND per decode step
         # (ArraysCache/SizedArraysCache: MiniMax, Qwen3.5-Next, GLM-5.3, ...)
@@ -9175,6 +9178,299 @@ class Scheduler:
                 return i
         return n
 
+    # Prompt-side splice of re-sent sampled output (_maybe_splice_prompt_to_stored).
+    _SPLICE_WINDOW = 8  # max tokens on either side of one re-aligned divergence
+    # Re-aligned divergences per request. A spliced conversation re-splices
+    # every historical split on each later turn, so this must cover a whole
+    # conversation's history, not one output (~50-100 us per divergence).
+    _SPLICE_MAX_DIVERGENCES = 1024
+    _SPLICE_CONTEXT_TOKENS = 4  # shared tokens decoded on each side of a window
+    _SPLICE_CONTEXT_WIDEN = 4  # extra context tried until the decode is clean
+    _SPLICE_TAIL_GUARD = 16  # the prompt's last tokens are never replaced
+    _SPLICE_MATCH_CHUNK = 1024  # C-level slice compare before the per-token loop
+    # Recent stored sequences kept for the divergence probe and the prompt
+    # splice (~4 bytes per token each). A conversation's newest entry must
+    # survive until its next turn arrives, including under concurrency.
+    _CACHE_PROBE_MAXLEN = 8
+
+    @staticmethod
+    def _match_run(a, ai: int, b, bi: int) -> int:
+        """Length of the equal run starting at a[ai] and b[bi].
+
+        Correct for any int sequences; fast when both are ``array('i')``
+        (equal-type slices compare in C; mixed types fall to the loop).
+        """
+        n = min(len(a) - ai, len(b) - bi)
+        if n <= 0:
+            return 0
+        k = 0
+        chunk = Scheduler._SPLICE_MATCH_CHUNK
+        while (
+            k + chunk <= n
+            and a[ai + k : ai + k + chunk] == b[bi + k : bi + k + chunk]
+        ):
+            k += chunk
+        while k < n and a[ai + k] == b[bi + k]:
+            k += 1
+        return k
+
+    def _splice_decode(self, ids: list[int]) -> str | None:
+        """Decode for text comparison; None when decoding fails."""
+        try:
+            try:
+                text = self.tokenizer.decode(
+                    ids,
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+            except TypeError:
+                text = self.tokenizer.decode(ids)
+        except Exception:
+            return None
+        return text if isinstance(text, str) else None
+
+    def _splice_protected_ids(self) -> frozenset[int]:
+        """Special and added-token ids: their decoded text is not their meaning."""
+        cached = getattr(self, "_splice_protected_ids_cache", None)
+        if cached is not None:
+            return cached
+        ids: set[int] = set()
+        tokenizer = getattr(self, "tokenizer", None)
+        for attr in ("all_special_ids", "added_tokens_decoder"):
+            try:
+                value = getattr(tokenizer, attr, None)
+                if isinstance(value, dict):
+                    ids.update(int(k) for k in value)
+                elif isinstance(value, (list, tuple, set, frozenset)):
+                    ids.update(int(v) for v in value)
+            except Exception:
+                continue
+        result = frozenset(ids)
+        self._splice_protected_ids_cache = result
+        return result
+
+    def _splice_window_equal(
+        self,
+        prompt: array,
+        pi: int,
+        pe: int,
+        seq: array,
+        sj: int,
+        se: int,
+        right_run: int,
+    ) -> bool:
+        """True when prompt[pi:pe] and seq[sj:se] are the same bytes.
+
+        Both windows are decoded between the same shared context. A decode
+        containing U+FFFD (an incomplete UTF-8 sequence, e.g. context that
+        starts or ends inside a character) proves nothing, so the context
+        widens until both decodes are clean; equal clean UTF-8 decodes mean
+        equal bytes. ``right_run`` is how many tokens after the windows the
+        two sequences share.
+        """
+        a = list(prompt[pi:pe])
+        b = list(seq[sj:se])
+        for extra in range(self._SPLICE_CONTEXT_WIDEN + 1):
+            width = self._SPLICE_CONTEXT_TOKENS + extra
+            left = list(prompt[max(0, pi - width) : pi])
+            right = list(prompt[pe : pe + min(width, right_run)])
+            text_a = self._splice_decode(left + a + right)
+            text_b = self._splice_decode(left + b + right)
+            if text_a is None or text_b is None:
+                return False
+            if "\ufffd" in text_a or "\ufffd" in text_b:
+                continue
+            return text_a == text_b
+        return False
+
+    def _resync_divergence(
+        self,
+        prompt: array,
+        pi: int,
+        seq: array,
+        sj: int,
+        protected: frozenset[int],
+        window: int,
+        prompt_limit: int,
+    ) -> tuple[int, int] | None:
+        """Smallest (i, j) where prompt[pi:pi+i] and seq[sj:sj+j] spell the same
+        text and the sequences agree again right after (or ``seq`` ends there)."""
+        max_ctx = self._SPLICE_CONTEXT_TOKENS + self._SPLICE_CONTEXT_WIDEN
+        pairs = sorted(
+            ((i, j) for i in range(1, window + 1) for j in range(1, window + 1)),
+            key=lambda ij: (ij[0] + ij[1], ij[0]),
+        )
+        for i, j in pairs:
+            pe, se = pi + i, sj + j
+            if pe > prompt_limit or se > len(seq):
+                continue
+            if se < len(seq) and prompt[pe] != seq[se]:
+                continue
+            if protected and (
+                protected.intersection(prompt[pi:pe])
+                or protected.intersection(seq[sj:se])
+            ):
+                continue
+            run = 0
+            while (
+                run < max_ctx
+                and pe + run < len(prompt)
+                and se + run < len(seq)
+                and prompt[pe + run] == seq[se + run]
+            ):
+                run += 1
+            if self._splice_window_equal(prompt, pi, pe, seq, sj, se, run):
+                return i, j
+        return None
+
+    def _splice_against_stored(
+        self,
+        prompt: list[int],
+        seq: array | list[int],
+        *,
+        window: int | None = None,
+        max_divergences: int | None = None,
+    ) -> tuple[list[int], int, int, int]:
+        """Put stored (sampled) ids back where the prompt spells the same text.
+
+        Returns ``(new_prompt, first_divergence, aligned_stored_len, resolved)``.
+        ``new_prompt`` is ``seq[:aligned_stored_len] + prompt[pi:]`` where
+        ``(pi, aligned_stored_len)`` is the last position at which both
+        sequences spell the same text. With ``resolved == 0`` it is ``prompt``
+        itself, unchanged. The last ``_SPLICE_TAIL_GUARD`` prompt tokens are
+        never replaced.
+        """
+        window = self._SPLICE_WINDOW if window is None else window
+        if max_divergences is None:
+            max_divergences = self._SPLICE_MAX_DIVERGENCES
+        a = array("i", prompt)
+        b = seq if isinstance(seq, array) else array("i", seq)
+        p0 = self._match_run(a, 0, b, 0)
+        prompt_limit = len(a) - self._SPLICE_TAIL_GUARD
+        protected = self._splice_protected_ids()
+        pi = sj = p0
+        resolved = 0
+        while resolved < max_divergences and pi < prompt_limit and sj < len(b):
+            step = self._resync_divergence(
+                a, pi, b, sj, protected, window, prompt_limit
+            )
+            if step is None:
+                break
+            pi += step[0]
+            sj += step[1]
+            resolved += 1
+            run = self._match_run(a, pi, b, sj)
+            pi += run
+            sj += run
+        if resolved == 0:
+            return prompt, p0, p0, 0
+        return b[:sj].tolist() + list(prompt[pi:]), p0, sj, resolved
+
+    def _maybe_splice_prompt_to_stored(self, request: Request) -> None:
+        """Re-align a prompt that re-sends previously sampled output.
+
+        Completed requests are stored under the ids the model sampled. The
+        next turn re-sends that output as text, and the tokenizer may split
+        it differently (a non-canonical BPE split), so the prefix cache stops
+        at the first block holding such a split. Where the prompt and a
+        recently stored sequence (``_cache_probe_seqs``) spell the same text
+        with different ids, put the stored ids back: the stored KV then
+        matches, and the decoded prompt text is unchanged. A spliced
+        conversation's later turns re-splice all earlier splits against the
+        newest stored entry. ``OMLX_DISABLE_SAMPLED_SPLICE=1`` turns this off.
+        """
+        if os.environ.get("OMLX_DISABLE_SAMPLED_SPLICE") == "1":
+            return
+        probe = getattr(self, "_cache_probe_seqs", None)
+        prompt = request.prompt_token_ids
+        if not probe or not prompt:
+            return
+        if getattr(self, "block_aware_cache", None) is None:
+            return
+        if (
+            request.skip_cache_store
+            or request.benchmark_trace
+            or request.images
+            or request.videos
+            or request.vlm_inputs_embeds is not None
+            or request.vlm_extra_kwargs
+            or request.vlm_image_hash
+            or request.vlm_cache_key_start
+            or request.vlm_cache_key_ranges
+            or request.specprefill_indices is not None
+        ):
+            return
+        if not callable(getattr(getattr(self, "tokenizer", None), "decode", None)):
+            return
+        if self._model_has_unreconstructible_cache():
+            return
+
+        prompt = list(prompt)
+        prompt_arr = array("i", prompt)
+        entries = []
+        for ref_id, seq in list(probe):
+            seq_arr = seq if isinstance(seq, array) else array("i", seq)
+            p = self._match_run(prompt_arr, 0, seq_arr, 0)
+            entries.append((ref_id, seq_arr, p))
+        best_p0 = max((p for _, _, p in entries), default=0)
+        if best_p0 <= 0 or best_p0 < (request.specprefill_system_end or 0):
+            return
+
+        # Every entry of one conversation ties at the first historical split,
+        # so choose by how far each re-aligns; newest first, so ties keep the
+        # newest entry.
+        block = max(1, self.config.paged_cache_block_size)
+        best = None  # (aligned, ref_id, stored_len, new_prompt, p0, resolved)
+        for ref_id, seq_arr, p in reversed(entries):
+            if p != best_p0 or len(seq_arr) <= p:
+                continue
+            if best is not None and len(seq_arr) <= best[0]:
+                continue  # cannot re-align further than the current best
+            new_prompt, p0, aligned, resolved = self._splice_against_stored(
+                prompt, seq_arr
+            )
+            if not resolved:
+                continue
+            if (aligned // block) * block >= len(new_prompt):
+                # The fetch would cover the whole prompt: stateful caches
+                # re-prefill on exact hits, so try an older entry instead.
+                continue
+            if best is None or aligned > best[0]:
+                best = (aligned, ref_id, len(seq_arr), new_prompt, p0, resolved)
+        if best is None:
+            return
+        aligned, best_id, stored_len, new_prompt, p0, resolved = best
+
+        gained = (aligned // block) * block - (p0 // block) * block
+        if gained <= 0:
+            logger.debug(
+                "prefix splice: request %s: re-aligned %d divergence(s) but "
+                "gains no block (prefix %d -> %d, block %d); left unchanged",
+                request.request_id,
+                resolved,
+                p0,
+                aligned,
+                block,
+            )
+            return
+
+        request.prompt_token_ids = new_prompt
+        request.num_prompt_tokens = len(new_prompt)
+        logger.info(
+            "prefix splice: request %s re-aligned %d sampled-token "
+            "divergence(s) with stored %s; matchable prefix %d -> %d of %d "
+            "stored tokens (+%d reusable), prompt %d -> %d tokens",
+            request.request_id,
+            resolved,
+            best_id,
+            p0,
+            aligned,
+            stored_len,
+            gained,
+            len(prompt),
+            len(new_prompt),
+        )
+
     # A re-prefill this large is a seconds-long event worth one INFO line
     # when a recently stored sequence shared at least a full block with the
     # prompt (i.e. the cache was relevant but could not cover the request).
@@ -9225,8 +9521,10 @@ class Scheduler:
             }
             return
         best_id, best_seq, best_p = None, None, -1
+        prompt_arr = array("i", prompt)
         for ref_id, seq in list(self._cache_probe_seqs):
-            p = self._common_prefix_len(prompt, seq)
+            seq_arr = seq if isinstance(seq, array) else array("i", seq)
+            p = self._match_run(prompt_arr, 0, seq_arr, 0)
             if p > best_p:
                 best_id, best_seq, best_p = ref_id, seq, p
         if best_seq is None:
@@ -9766,6 +10064,11 @@ class Scheduler:
             else:
                 request.prompt_token_ids = list(request.prompt)
             request.num_prompt_tokens = len(request.prompt_token_ids)
+            # Put sampled ids back where the prompt re-sends stored output
+            # as text, so the prefix cache matches past the re-tokenization.
+            # Runs before the generation prompt is located: that lookup is
+            # end-relative and the splice never rewrites the prompt's tail.
+            self._maybe_splice_prompt_to_stored(request)
         self._resolve_generation_prompt_start(request)
         if self.moe_offload_stats is not None:
             request.moe_offload_start = self.moe_offload_stats()
