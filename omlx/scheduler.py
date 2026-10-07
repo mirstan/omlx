@@ -9637,8 +9637,12 @@ class Scheduler:
         at the first block holding such a split. Where the prompt and a
         splice reference (``_splice_refs``, one stored sequence per
         conversation, kept across restarts with the SSD cache) spell the same
-        text with different ids, put the stored ids back: the stored KV then
-        matches, and the decoded prompt text is unchanged. A spliced
+        text with different ids, put the stored ids back so the lookup can
+        match the stored KV; the decoded prompt text is unchanged. A
+        registered reference does not prove its KV is retrievable, so the
+        request keeps an undo record (``_splice_undo``) and
+        ``_prepare_prefix_cache_for_request`` reverts the splice when the
+        lookup reuses nothing past the first divergence. A spliced
         conversation's later turns re-splice all earlier splits against its
         newest stored sequence. ``OMLX_DISABLE_SAMPLED_SPLICE=1`` turns this
         off.
@@ -9724,6 +9728,7 @@ class Scheduler:
             )
             return
 
+        request._splice_undo = (prompt, p0)
         request.prompt_token_ids = new_prompt
         request.num_prompt_tokens = len(new_prompt)
         with lock:
@@ -10065,6 +10070,34 @@ class Scheduler:
         self._unreconstructible_cache_model = result
         return result
 
+    def _revert_unbacked_splice(self, request: Request, block_table, remaining):
+        """Undo a prompt splice the prefix-cache lookup did not back.
+
+        Returns the lookup's remaining tokens, recomputed against the
+        restored prompt when the splice is reverted. A lookup that stops at
+        or before the first divergence reused only tokens both prompts share,
+        so the spliced ids bought nothing and the canonical ids are kept.
+        """
+        undo = getattr(request, "_splice_undo", None)
+        if undo is None:
+            return remaining
+        request._splice_undo = None
+        original_prompt, p0 = undo
+        cached = block_table.num_tokens if block_table else 0
+        if cached > p0:
+            return remaining
+        request.prompt_token_ids = original_prompt
+        request.num_prompt_tokens = len(original_prompt)
+        request.generation_prompt_start = 0
+        self._resolve_generation_prompt_start(request)
+        logger.info(
+            "prefix splice: request %s reverted (cached %d <= first divergence %d)",
+            request.request_id,
+            cached,
+            p0,
+        )
+        return original_prompt[cached:]
+
     def _prepare_prefix_cache_for_request(self, request: Request) -> None:
         if request.request_id in self._prefix_cache_prepared:
             return
@@ -10094,6 +10127,7 @@ class Scheduler:
                     extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
                 )
             fetch_ms = (time.perf_counter() - fetch_started) * 1000.0
+            remaining = self._revert_unbacked_splice(request, block_table, remaining)
             # A split GDN sidecar represents state at a full block boundary.
             # Exact-hit generation needs N-1 state, which Arrays/GDN cannot
             # produce by trimming one token. Re-prefill only the final block.
@@ -10266,7 +10300,9 @@ class Scheduler:
             else:
                 request.remaining_tokens = request.prompt_token_ids
         else:
-            # No paged SSD cache configured - process all tokens
+            # No paged SSD cache configured - process all tokens. The splice
+            # no-ops here, so this only keeps an undo record from leaking.
+            request._splice_undo = None
             request.remaining_tokens = request.prompt_token_ids
 
         # Lightning-MTP has a small prompt-history cache separate from the
@@ -10338,7 +10374,8 @@ class Scheduler:
                 request.prompt_token_ids = list(request.prompt)
             request.num_prompt_tokens = len(request.prompt_token_ids)
             # Put sampled ids back where the prompt re-sends stored output
-            # as text, so the prefix cache matches past the re-tokenization.
+            # as text, so the prefix cache can match past the re-tokenization
+            # (the lookup reverts a splice the cache does not back).
             # Runs before the generation prompt is located: that lookup is
             # end-relative and the splice never rewrites the prompt's tail.
             self._maybe_splice_prompt_to_stored(request)

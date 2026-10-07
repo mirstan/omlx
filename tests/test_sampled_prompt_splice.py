@@ -511,6 +511,144 @@ class TestAddRequestSplice:
         assert pre.num_prompt_tokens == len(PROMPT)
 
 
+class _FetchCache:
+    """Fake block-aware cache whose lookup reuses ``num_tokens`` tokens."""
+
+    def __init__(self, num_tokens):
+        self.num_tokens = num_tokens
+
+    def fetch_cache(self, request_id, tokens, **kwargs):
+        if self.num_tokens is None:
+            return None, list(tokens)
+        table = SimpleNamespace(
+            num_tokens=self.num_tokens,
+            block_ids=list(range(self.num_tokens // 64)),
+        )
+        return table, list(tokens[self.num_tokens :])
+
+    def reconstruct_cache(self, block_table, **kwargs):
+        return [object()]
+
+
+def _make_lookup_scheduler(num_tokens):
+    """Admission scheduler that runs the whole prefix-cache lookup.
+
+    Helpers after the fetch that need a real model or cache are stubbed:
+    no GDN split, no memory pressure, no MiniMax alignment, no divergence
+    probe and no SpecPrefill.
+    """
+    sched = _make_admission_scheduler(encode_map={"<GEN>": GEN})
+    sched.block_aware_cache = _FetchCache(num_tokens)
+    sched.paged_cache_manager = None
+    sched.model = SimpleNamespace()
+    sched._prefix_cache_prepared = set()
+    sched._phase_timer = lambda phase: nullcontext()
+    sched._gdn_split_active = lambda: False
+    sched._bypass_hot_cache_under_pressure = lambda: False
+    sched._align_minimax_m3_partial_cache_to_prefill_step = lambda req: False
+    sched._log_prefix_divergence = lambda req: None
+    sched._try_specprefill_scoring = lambda req: None
+    return sched
+
+
+def _spliced_request(sched):
+    _ref(sched, "req-old", STORED)
+    req = _request(PROMPT + GEN, generation_prompt_text="<GEN>")
+    sched._maybe_splice_prompt_to_stored(req)
+    sched._resolve_generation_prompt_start(req)
+    assert req.prompt_token_ids == SPLICED + GEN
+    assert req.generation_prompt_start == len(SPLICED)
+    return req
+
+
+def _assert_canonical(req, cached):
+    assert req.prompt_token_ids == PROMPT + GEN
+    assert req.num_prompt_tokens == len(PROMPT + GEN)
+    assert req.generation_prompt_start == len(PROMPT)
+    assert req.remaining_tokens == (PROMPT + GEN)[cached:]
+    assert getattr(req, "_splice_undo", None) is None
+
+
+class TestLookupRevertsUnbackedSplice:
+    @pytest.mark.parametrize("num_tokens", [None, 0, 64])
+    def test_lookup_at_or_before_divergence_reverts(self, num_tokens, caplog):
+        # p0 = len(A) = 100: every reused token precedes the divergence.
+        sched = _make_lookup_scheduler(num_tokens)
+        req = _spliced_request(sched)
+
+        with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+            sched._prepare_prefix_cache_for_request(req)
+
+        cached = num_tokens or 0
+        _assert_canonical(req, cached)
+        msgs = [r.getMessage() for r in _infos(caplog)]
+        assert (
+            f"prefix splice: request req-new reverted (cached {cached} "
+            f"<= first divergence {len(A)})"
+        ) in msgs
+
+    def test_lookup_exactly_at_divergence_reverts(self):
+        sched = _make_lookup_scheduler(len(A))
+        req = _spliced_request(sched)
+
+        sched._prepare_prefix_cache_for_request(req)
+
+        _assert_canonical(req, len(A))
+
+    def test_lookup_past_divergence_keeps_splice(self, caplog):
+        sched = _make_lookup_scheduler(128)
+        req = _spliced_request(sched)
+
+        with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+            sched._prepare_prefix_cache_for_request(req)
+
+        assert req.prompt_token_ids == SPLICED + GEN
+        assert req.num_prompt_tokens == len(SPLICED + GEN)
+        assert req.generation_prompt_start == len(SPLICED)
+        assert req.remaining_tokens == (SPLICED + GEN)[128:]
+        assert getattr(req, "_splice_undo", None) is None
+        assert not any("reverted" in r.getMessage() for r in caplog.records)
+
+    def test_unspliced_request_is_untouched(self, caplog):
+        sched = _make_lookup_scheduler(None)
+        req = _request(PROMPT + GEN, generation_prompt_text="<GEN>")
+        sched._resolve_generation_prompt_start(req)
+
+        with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+            sched._prepare_prefix_cache_for_request(req)
+
+        assert req.prompt_token_ids == PROMPT + GEN
+        assert req.generation_prompt_start == len(PROMPT)
+        assert req.remaining_tokens == PROMPT + GEN
+        assert not any("reverted" in r.getMessage() for r in caplog.records)
+
+    def test_no_block_aware_cache_clears_record_without_revert(self):
+        sched = _make_lookup_scheduler(None)
+        req = _spliced_request(sched)
+        sched.block_aware_cache = None
+
+        sched._prepare_prefix_cache_for_request(req)
+
+        assert req.prompt_token_ids == SPLICED + GEN
+        assert getattr(req, "_splice_undo", None) is None
+
+    def test_add_request_splice_then_empty_cache_reverts(self):
+        sched = _make_lookup_scheduler(None)
+        _ref(sched, "req-old", STORED)
+        req = Request(
+            request_id="req-new",
+            prompt=PROMPT + GEN,
+            sampling_params=SamplingParams(),
+            generation_prompt_text="<GEN>",
+        )
+
+        sched.add_request(req)
+        assert req.prompt_token_ids == SPLICED + GEN
+        sched._prepare_prefix_cache_for_request(req)
+
+        _assert_canonical(req, 0)
+
+
 def _ref_dir(ssd_dir, model_name="test-model"):
     model_key = hashlib.sha256(model_name.encode()).hexdigest()[:16]
     return ssd_dir / "splice_refs" / model_key
