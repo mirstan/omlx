@@ -2200,8 +2200,8 @@ class Scheduler:
         self._cache_probe_seqs: deque[tuple[str, array | list[int]]] = deque(
             maxlen=self._CACHE_PROBE_MAXLEN
         )
-        # Splice references (_maybe_splice_prompt_to_stored): one stored
-        # sequence per conversation, LRU, persisted next to the SSD cache.
+        # Splice references (_maybe_splice_prompt_to_stored): stored
+        # sequences, LRU, persisted next to the SSD cache (_persist_splice_ref).
         self._splice_refs: OrderedDict[str, array] = OrderedDict()
         self._splice_refs_lock = threading.Lock()
 
@@ -2616,7 +2616,7 @@ class Scheduler:
 
         Returns False when the store raised (it is logged, not re-raised),
         True otherwise. On success the request's splice reference is
-        persisted (_persist_splice_ref).
+        persisted and supersedes older turns (_persist_splice_ref).
 
         Pre-conditions enforced by the caller (_cleanup_finished):
         - mx.eval() (a FULL, blocking eval — NOT async_eval) was called on
@@ -9212,10 +9212,11 @@ class Scheduler:
     # Recent stored sequences kept for the divergence probe (~4 bytes per
     # token each). The splice reads _splice_refs instead.
     _CACHE_PROBE_MAXLEN = 8
-    # Splice references: stored sequences keyed by request id, LRU. A new
-    # reference supersedes every reference that is a prefix of it (the same
-    # conversation's earlier turns), so these caps count conversations, not
-    # completions.
+    # Splice references: stored sequences keyed by request id, LRU. Once a
+    # reference's store succeeds it supersedes every reference that is a
+    # prefix of it, so the superseded turns of one conversation collapse into
+    # one entry; a turn that does not extend the previous stored sequence
+    # takes its own entry.
     _SPLICE_REF_MAX_ENTRIES = 64
     _SPLICE_REF_MAX_TOKENS = 8_000_000
     _SPLICE_REF_SUFFIX = ".i32"
@@ -9321,11 +9322,11 @@ class Scheduler:
         self._enforce_splice_ref_caps_locked()
 
     def _register_splice_ref(self, request_id: str, seq: array) -> None:
-        """Record a sequence submitted to store_cache as a splice reference.
+        """Record a sequence about to be submitted to store_cache.
 
-        Every reference that is a prefix of ``seq`` (an earlier turn of the
-        same conversation) is dropped. Persisted by the store worker after
-        the store succeeds (_persist_splice_ref).
+        Older references are left alone until the store succeeds: the store
+        worker then persists this one and drops the references it supersedes
+        (_persist_splice_ref).
         """
         lock = getattr(self, "_splice_refs_lock", None)
         if lock is None or getattr(self, "_splice_refs", None) is None:
@@ -9335,19 +9336,25 @@ class Scheduler:
             refs = self._splice_refs
             if request_id in refs:
                 self._discard_splice_ref_locked(request_id)
-            superseded = [
-                key
-                for key, old in refs.items()
-                if len(old) <= len(seq)
-                and self._match_run(seq, 0, old, 0) == len(old)
-            ]
-            for key in superseded:
-                self._discard_splice_ref_locked(key)
             refs[request_id] = seq
             self._enforce_splice_ref_caps_locked()
 
+    def _supersede_splice_refs_locked(self, request_id: str, seq: array) -> None:
+        """Drop every other reference that is a prefix of ``seq`` (an earlier
+        turn of the same conversation). Caller holds the lock."""
+        superseded = [
+            key
+            for key, old in self._splice_refs.items()
+            if key != request_id
+            and len(old) <= len(seq)
+            and self._match_run(seq, 0, old, 0) == len(old)
+        ]
+        for key in superseded:
+            self._discard_splice_ref_locked(key)
+
     def _drop_splice_ref(self, request_id: str) -> None:
-        """Forget a reference whose store failed, in memory and on disk."""
+        """Forget a reference whose store failed or was never submitted, in
+        memory and on disk."""
         lock = getattr(self, "_splice_refs_lock", None)
         if lock is None or getattr(self, "_splice_refs", None) is None:
             return
@@ -9356,19 +9363,25 @@ class Scheduler:
                 self._discard_splice_ref_locked(request_id)
 
     def _persist_splice_ref(self, request_id: str) -> None:
-        """Write a reference to disk after its store succeeded. Best effort.
+        """Commit a reference after its store succeeded. Best effort.
 
-        Runs on the store worker. The file is replaced into place only if
+        Runs on the store worker, the one success point of both the async
+        and the synchronous store. The file is replaced into place only if
         the reference is still registered, so a reference superseded or
-        evicted meanwhile leaves no file behind.
+        evicted meanwhile leaves no file behind. Only after that replace
+        (or, without persistence, right away) does the reference supersede
+        the older references that are a prefix of it, so a store that fails
+        never costs the conversation its previous reference.
         """
         lock = getattr(self, "_splice_refs_lock", None)
-        directory = self._splice_ref_dir()
-        if lock is None or directory is None:
+        if lock is None:
             return
+        directory = self._splice_ref_dir()
         with lock:
             seq = getattr(self, "_splice_refs", {}).get(request_id)
-        if seq is None:
+            if seq is not None and directory is None:
+                self._supersede_splice_refs_locked(request_id, seq)
+        if seq is None or directory is None:
             return
         name = self._splice_ref_filename(request_id)
         tmp = directory / f".{name}.{os.getpid()}.{threading.get_ident()}.tmp"
@@ -9378,12 +9391,55 @@ class Scheduler:
             with lock:
                 if self._splice_refs.get(request_id) is seq:
                     os.replace(tmp, directory / name)
+                    self._supersede_splice_refs_locked(request_id, seq)
                     return
             tmp.unlink(missing_ok=True)
         except OSError as e:
             logger.debug("splice ref: cannot persist %s: %s", request_id, e)
             with suppress(OSError):
                 tmp.unlink(missing_ok=True)
+
+    def clear_splice_refs(self) -> int:
+        """Forget every splice reference, in memory and on disk.
+
+        The hook for paths that clear the prefix cache: a reference must not
+        outlive the cache it points at. Deletes this model's reference files
+        (best effort) and marks the store loaded so a later lazy load cannot
+        bring them back. Returns the number of references removed.
+        """
+        lock = getattr(self, "_splice_refs_lock", None)
+        if lock is None or getattr(self, "_splice_refs", None) is None:
+            return 0
+        with lock:
+            refs = self._splice_refs
+            removed = len(refs)
+            in_memory = {self._splice_ref_filename(key) for key in refs}
+            refs.clear()
+            names = getattr(self, "_splice_ref_names", None)
+            if names is not None:
+                names.clear()
+            self._splice_refs_loaded = True
+            directory = self._splice_ref_dir()
+            if directory is None:
+                return removed
+            try:
+                paths = list(directory.iterdir())
+            except OSError as e:
+                if not isinstance(e, FileNotFoundError):
+                    logger.debug("splice ref: cannot scan %s: %s", directory, e)
+                return removed
+            for path in paths:
+                is_ref = path.suffix == self._SPLICE_REF_SUFFIX
+                if not is_ref and not path.name.endswith(".tmp"):
+                    continue
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as e:
+                    logger.debug("splice ref: cannot delete %s: %s", path.name, e)
+                    continue
+                if is_ref and path.name not in in_memory:
+                    removed += 1
+            return removed
 
     @staticmethod
     def _match_run(a, ai: int, b, bi: int) -> int:
@@ -13347,12 +13403,6 @@ class Scheduler:
                                 self._cache_probe_seqs.append(
                                     (request.request_id, stored_seq)
                                 )
-                                # Registered before the store is submitted so
-                                # the next turn finds it; dropped again if the
-                                # store fails.
-                                self._register_splice_ref(
-                                    request.request_id, stored_seq
-                                )
                                 with self._phase_timer("store_cache_main_collect"):
                                     pre_eval_arrays = (
                                         self._collect_arrays_from_extracted_cache(
@@ -13405,6 +13455,10 @@ class Scheduler:
                                     request_id,
                                 )
 
+                            # Registered right before the store is handed
+                            # off so the next turn finds it; dropped again
+                            # if the store fails or is never submitted.
+                            self._register_splice_ref(request_id, stored_seq)
                             if self._store_cache_executor is not None:
                                 # Hand host memcpy and disk write to the
                                 # background executor after the owner thread
@@ -13538,6 +13592,7 @@ class Scheduler:
                             logger.debug(
                                 f"Failed to submit async store for {request_id}: {e}"
                             )
+                            self._drop_splice_ref(request_id)
                     else:
                         # No extracted_cache to store, but ensure block leak guard.
                         block_table = None
@@ -14480,6 +14535,7 @@ class Scheduler:
         # Clear caches
         if self.block_aware_cache is not None:
             self.block_aware_cache.clear()
+        self.clear_splice_refs()
         self._cache_rate_tracker.clear()
         self._boundary_snapshot_diagnostics.clear()
         self._last_prefix_cache_lookup = None
