@@ -14,6 +14,7 @@ The scheduler follows vLLM's design with:
 import concurrent.futures
 import copy
 import gc
+import hashlib
 import importlib
 import inspect
 import logging
@@ -2199,6 +2200,10 @@ class Scheduler:
         self._cache_probe_seqs: deque[tuple[str, array | list[int]]] = deque(
             maxlen=self._CACHE_PROBE_MAXLEN
         )
+        # Splice references (_maybe_splice_prompt_to_stored): one stored
+        # sequence per conversation, LRU, persisted next to the SSD cache.
+        self._splice_refs: OrderedDict[str, array] = OrderedDict()
+        self._splice_refs_lock = threading.Lock()
 
         # Hybrid models whose recurrent state is REBOUND per decode step
         # (ArraysCache/SizedArraysCache: MiniMax, Qwen3.5-Next, GLM-5.3, ...)
@@ -2606,8 +2611,12 @@ class Scheduler:
         extra_key_token_start: int | None,
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None,
         hot_cache_write_back: bool = True,
-    ) -> None:
+    ) -> bool:
         """Run store_cache + paged_cache cleanup off the inference thread.
+
+        Returns False when the store raised (it is logged, not re-raised),
+        True otherwise. On success the request's splice reference is
+        persisted (_persist_splice_ref).
 
         Pre-conditions enforced by the caller (_cleanup_finished):
         - mx.eval() (a FULL, blocking eval — NOT async_eval) was called on
@@ -2687,6 +2696,12 @@ class Scheduler:
                 self.block_aware_cache.clear_request_entry(request_id)
         except Exception as e:
             logger.warning("Async store_cache failed for %s: %s", request_id, e)
+            return False
+        try:
+            self._persist_splice_ref(request_id)
+        except Exception as e:  # best effort: never fail a completed store
+            logger.debug("splice ref: persist failed for %s: %s", request_id, e)
+        return True
 
     def _drain_pending_async_removes(self) -> bool:
         """Process deferred batch_generator.remove() calls from prior steps.
@@ -2709,16 +2724,22 @@ class Scheduler:
                 pending.append((uid, request_id, future))
                 continue
             # Surface worker exceptions for visibility (don't crash step loop).
+            # A store that did not complete leaves no cache behind its splice
+            # reference, so the reference is dropped.
             if future is not None:
                 try:
                     exc = future.exception()
                 except concurrent.futures.CancelledError:
                     logger.warning("Async store_cache for %s was cancelled", request_id)
+                    self._drop_splice_ref(request_id)
                 else:
                     if exc is not None:
                         logger.warning(
                             "Async store_cache for %s raised: %s", request_id, exc
                         )
+                        self._drop_splice_ref(request_id)
+                    elif future.result() is False:
+                        self._drop_splice_ref(request_id)
             try:
                 # A batch generator reset drops this row and the next generator
                 # reuses uids from 0. Touch the uid only while this request owns it.
@@ -9188,10 +9209,181 @@ class Scheduler:
     _SPLICE_CONTEXT_WIDEN = 4  # extra context tried until the decode is clean
     _SPLICE_TAIL_GUARD = 16  # the prompt's last tokens are never replaced
     _SPLICE_MATCH_CHUNK = 1024  # C-level slice compare before the per-token loop
-    # Recent stored sequences kept for the divergence probe and the prompt
-    # splice (~4 bytes per token each). A conversation's newest entry must
-    # survive until its next turn arrives, including under concurrency.
+    # Recent stored sequences kept for the divergence probe (~4 bytes per
+    # token each). The splice reads _splice_refs instead.
     _CACHE_PROBE_MAXLEN = 8
+    # Splice references: stored sequences keyed by request id, LRU. A new
+    # reference supersedes every reference that is a prefix of it (the same
+    # conversation's earlier turns), so these caps count conversations, not
+    # completions.
+    _SPLICE_REF_MAX_ENTRIES = 64
+    _SPLICE_REF_MAX_TOKENS = 8_000_000
+    _SPLICE_REF_SUFFIX = ".i32"
+
+    def _splice_ref_dir(self) -> Path | None:
+        """Directory persisting this model's splice references, or None.
+
+        None without an SSD cache directory and in hot-cache-only mode,
+        where the stored KV does not outlive the process either. The
+        directory is per model because the SSD cache directory is shared
+        between the models a server loads.
+        """
+        config = getattr(self, "config", None)
+        root = getattr(config, "paged_ssd_cache_dir", None)
+        if not isinstance(root, str) or not root:
+            return None
+        if getattr(config, "hot_cache_only", False) is True:
+            return None
+        model_name = getattr(config, "model_name", None)
+        model_key = hashlib.sha256(str(model_name).encode()).hexdigest()[:16]
+        return Path(root) / "splice_refs" / model_key
+
+    def _splice_ref_filename(self, key: str) -> str:
+        names = getattr(self, "_splice_ref_names", None)
+        if names is not None and key in names:
+            return names[key]
+        digest = hashlib.sha256(key.encode()).hexdigest()[:32]
+        return digest + self._SPLICE_REF_SUFFIX
+
+    def _unlink_splice_ref_file(self, directory: Path | None, name: str) -> None:
+        if directory is None:
+            return
+        try:
+            (directory / name).unlink(missing_ok=True)
+        except OSError as e:
+            logger.debug("splice ref: cannot delete %s: %s", name, e)
+
+    def _discard_splice_ref_locked(self, key: str) -> None:
+        """Forget one reference and its file. Caller holds the lock."""
+        name = self._splice_ref_filename(key)
+        self._splice_refs.pop(key, None)
+        names = getattr(self, "_splice_ref_names", None)
+        if names is not None:
+            names.pop(key, None)
+        self._unlink_splice_ref_file(self._splice_ref_dir(), name)
+
+    def _enforce_splice_ref_caps_locked(self) -> None:
+        refs = self._splice_refs
+        total = sum(len(seq) for seq in refs.values())
+        while refs and (
+            len(refs) > self._SPLICE_REF_MAX_ENTRIES
+            or total > self._SPLICE_REF_MAX_TOKENS
+        ):
+            oldest = next(iter(refs))
+            total -= len(refs[oldest])
+            self._discard_splice_ref_locked(oldest)
+
+    def _load_splice_refs_locked(self) -> None:
+        """Load persisted references once per scheduler. Caller holds the lock.
+
+        Files are loaded oldest first, so the newest end up most recent.
+        Unreadable and malformed files are skipped and deleted when possible.
+        """
+        if getattr(self, "_splice_refs_loaded", False):
+            return
+        self._splice_refs_loaded = True
+        directory = self._splice_ref_dir()
+        if directory is None:
+            return
+        try:
+            found = []
+            for path in directory.iterdir():
+                if path.name.endswith(".tmp"):
+                    self._unlink_splice_ref_file(directory, path.name)
+                elif path.suffix == self._SPLICE_REF_SUFFIX:
+                    found.append((path.stat().st_mtime, path))
+        except OSError as e:
+            if not isinstance(e, FileNotFoundError):
+                logger.debug("splice ref: cannot scan %s: %s", directory, e)
+            return
+        names = getattr(self, "_splice_ref_names", None)
+        if names is None:
+            names = self._splice_ref_names = {}
+        loaded: OrderedDict[str, array] = OrderedDict()
+        for _, path in sorted(found, key=lambda item: item[0]):
+            try:
+                data = path.read_bytes()
+            except OSError as e:
+                logger.debug("splice ref: cannot read %s: %s", path.name, e)
+                continue
+            if not data or len(data) % 4:
+                self._unlink_splice_ref_file(directory, path.name)
+                continue
+            seq = array("i")
+            seq.frombytes(data)
+            key = path.stem
+            loaded[key] = seq
+            names[key] = path.name
+        for key, seq in self._splice_refs.items():
+            loaded.pop(key, None)
+            loaded[key] = seq
+        self._splice_refs = loaded
+        self._enforce_splice_ref_caps_locked()
+
+    def _register_splice_ref(self, request_id: str, seq: array) -> None:
+        """Record a sequence submitted to store_cache as a splice reference.
+
+        Every reference that is a prefix of ``seq`` (an earlier turn of the
+        same conversation) is dropped. Persisted by the store worker after
+        the store succeeds (_persist_splice_ref).
+        """
+        lock = getattr(self, "_splice_refs_lock", None)
+        if lock is None or getattr(self, "_splice_refs", None) is None:
+            return
+        with lock:
+            self._load_splice_refs_locked()
+            refs = self._splice_refs
+            if request_id in refs:
+                self._discard_splice_ref_locked(request_id)
+            superseded = [
+                key
+                for key, old in refs.items()
+                if len(old) <= len(seq)
+                and self._match_run(seq, 0, old, 0) == len(old)
+            ]
+            for key in superseded:
+                self._discard_splice_ref_locked(key)
+            refs[request_id] = seq
+            self._enforce_splice_ref_caps_locked()
+
+    def _drop_splice_ref(self, request_id: str) -> None:
+        """Forget a reference whose store failed, in memory and on disk."""
+        lock = getattr(self, "_splice_refs_lock", None)
+        if lock is None or getattr(self, "_splice_refs", None) is None:
+            return
+        with lock:
+            if request_id in self._splice_refs:
+                self._discard_splice_ref_locked(request_id)
+
+    def _persist_splice_ref(self, request_id: str) -> None:
+        """Write a reference to disk after its store succeeded. Best effort.
+
+        Runs on the store worker. The file is replaced into place only if
+        the reference is still registered, so a reference superseded or
+        evicted meanwhile leaves no file behind.
+        """
+        lock = getattr(self, "_splice_refs_lock", None)
+        directory = self._splice_ref_dir()
+        if lock is None or directory is None:
+            return
+        with lock:
+            seq = getattr(self, "_splice_refs", {}).get(request_id)
+        if seq is None:
+            return
+        name = self._splice_ref_filename(request_id)
+        tmp = directory / f".{name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            tmp.write_bytes(seq.tobytes())
+            with lock:
+                if self._splice_refs.get(request_id) is seq:
+                    os.replace(tmp, directory / name)
+                    return
+            tmp.unlink(missing_ok=True)
+        except OSError as e:
+            logger.debug("splice ref: cannot persist %s: %s", request_id, e)
+            with suppress(OSError):
+                tmp.unlink(missing_ok=True)
 
     @staticmethod
     def _match_run(a, ai: int, b, bi: int) -> int:
@@ -9373,17 +9565,21 @@ class Scheduler:
         next turn re-sends that output as text, and the tokenizer may split
         it differently (a non-canonical BPE split), so the prefix cache stops
         at the first block holding such a split. Where the prompt and a
-        recently stored sequence (``_cache_probe_seqs``) spell the same text
-        with different ids, put the stored ids back: the stored KV then
+        splice reference (``_splice_refs``, one stored sequence per
+        conversation, kept across restarts with the SSD cache) spell the same
+        text with different ids, put the stored ids back: the stored KV then
         matches, and the decoded prompt text is unchanged. A spliced
-        conversation's later turns re-splice all earlier splits against the
-        newest stored entry. ``OMLX_DISABLE_SAMPLED_SPLICE=1`` turns this off.
+        conversation's later turns re-splice all earlier splits against its
+        newest stored sequence. ``OMLX_DISABLE_SAMPLED_SPLICE=1`` turns this
+        off.
         """
         if os.environ.get("OMLX_DISABLE_SAMPLED_SPLICE") == "1":
             return
-        probe = getattr(self, "_cache_probe_seqs", None)
+        lock = getattr(self, "_splice_refs_lock", None)
         prompt = request.prompt_token_ids
-        if not probe or not prompt:
+        if lock is None or getattr(self, "_splice_refs", None) is None:
+            return
+        if not prompt:
             return
         if getattr(self, "block_aware_cache", None) is None:
             return
@@ -9405,20 +9601,24 @@ class Scheduler:
         if self._model_has_unreconstructible_cache():
             return
 
+        with lock:
+            self._load_splice_refs_locked()
+            refs = list(self._splice_refs.items())
+        if not refs:
+            return
         prompt = list(prompt)
         prompt_arr = array("i", prompt)
         entries = []
-        for ref_id, seq in list(probe):
-            seq_arr = seq if isinstance(seq, array) else array("i", seq)
+        for ref_id, seq_arr in refs:
             p = self._match_run(prompt_arr, 0, seq_arr, 0)
             entries.append((ref_id, seq_arr, p))
         best_p0 = max((p for _, _, p in entries), default=0)
         if best_p0 <= 0 or best_p0 < (request.specprefill_system_end or 0):
             return
 
-        # Every entry of one conversation ties at the first historical split,
-        # so choose by how far each re-aligns; newest first, so ties keep the
-        # newest entry.
+        # References that share a prompt prefix can tie at the first
+        # historical split, so choose by how far each re-aligns; most recent
+        # first, so ties keep the most recently stored or used reference.
         block = max(1, self.config.paged_cache_block_size)
         best = None  # (aligned, ref_id, stored_len, new_prompt, p0, resolved)
         for ref_id, seq_arr, p in reversed(entries):
@@ -9456,6 +9656,9 @@ class Scheduler:
 
         request.prompt_token_ids = new_prompt
         request.num_prompt_tokens = len(new_prompt)
+        with lock:
+            if best_id in self._splice_refs:
+                self._splice_refs.move_to_end(best_id)
         logger.info(
             "prefix splice: request %s re-aligned %d sampled-token "
             "divergence(s) with stored %s; matchable prefix %d -> %d of %d "
@@ -13138,13 +13341,17 @@ class Scheduler:
                                 # store_cache, including boundary truncation.
                                 # Always maintained so the large-re-prefill
                                 # INFO line can name the divergence point;
-                                # int32 array keeps the deque(maxlen=4) at
-                                # ~400KB per 100k-token sequence.
+                                # int32 arrays take ~400KB per 100k-token
+                                # sequence.
+                                stored_seq = array("i", token_sequence_to_store)
                                 self._cache_probe_seqs.append(
-                                    (
-                                        request.request_id,
-                                        array("i", token_sequence_to_store),
-                                    )
+                                    (request.request_id, stored_seq)
+                                )
+                                # Registered before the store is submitted so
+                                # the next turn finds it; dropped again if the
+                                # store fails.
+                                self._register_splice_ref(
+                                    request.request_id, stored_seq
                                 )
                                 with self._phase_timer("store_cache_main_collect"):
                                     pre_eval_arrays = (
@@ -13245,7 +13452,7 @@ class Scheduler:
                                 )
                             else:
                                 # Executor unavailable — synchronous fallback.
-                                self._async_store_cache_worker(
+                                stored_ok = self._async_store_cache_worker(
                                     request_id,
                                     token_sequence_to_store,
                                     cache_to_store,
@@ -13256,6 +13463,8 @@ class Scheduler:
                                     request.vlm_extra_key_ranges_for_cache,
                                     hot_cache_write_back,
                                 )
+                                if stored_ok is False:
+                                    self._drop_splice_ref(request_id)
                             logger.debug(
                                 f"Submitted async store_cache for {request_id} "
                                 f"({len(token_sequence_to_store)} tokens, "

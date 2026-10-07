@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the prompt-side splice of re-sent sampled output tokens."""
 
+import concurrent.futures
+import hashlib
 import logging
+import threading
 from array import array
-from collections import deque
+from collections import OrderedDict, deque
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -77,16 +81,26 @@ STORED_MANY = A + [t for s in SEGS for t in [10, 11] + s]
 PROMPT_MANY = A + [t for s in SEGS for t in [12] + s] + C
 
 
-def _make_scheduler(block_size=64, encode_map=None):
+def _make_scheduler(block_size=64, encode_map=None, ssd_dir=None):
     sched = object.__new__(Scheduler)
     sched._cache_probe_seqs = deque(maxlen=8)
+    sched._splice_refs = OrderedDict()
+    sched._splice_refs_lock = threading.Lock()
     sched.tokenizer = _PieceTokenizer(encode_map=encode_map)
     sched.config = MagicMock(spec=[])
     sched.config.paged_cache_block_size = block_size
     sched.config.max_num_seqs = 4
+    sched.config.paged_ssd_cache_dir = None if ssd_dir is None else str(ssd_dir)
+    sched.config.hot_cache_only = False
+    sched.config.model_name = "test-model"
     sched.block_aware_cache = object()
     sched._unreconstructible_cache_model = False
     return sched
+
+
+def _ref(sched, request_id, seq):
+    """Register a stored sequence as the store submit path does."""
+    sched._register_splice_ref(request_id, array("i", seq))
 
 
 class TestSpliceAgainstStored:
@@ -237,7 +251,7 @@ def _infos(caplog):
 class TestMaybeSplicePrompt:
     def test_splices_request_and_logs_one_info_line(self, caplog):
         sched = _make_scheduler(block_size=64)
-        sched._cache_probe_seqs.append(("req-old", array("i", STORED)))
+        _ref(sched, "req-old", STORED)
         req = _request(PROMPT)
 
         with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
@@ -260,7 +274,7 @@ class TestMaybeSplicePrompt:
 
     def test_second_call_is_noop(self, caplog):
         sched = _make_scheduler(block_size=64)
-        sched._cache_probe_seqs.append(("req-old", array("i", STORED)))
+        _ref(sched, "req-old", STORED)
         req = _request(PROMPT)
         with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
             sched._maybe_splice_prompt_to_stored(req)
@@ -270,9 +284,9 @@ class TestMaybeSplicePrompt:
 
     def test_picks_best_stored_sequence(self, caplog):
         sched = _make_scheduler(block_size=64)
-        sched._cache_probe_seqs.append(("req-a", array("i", [7] * 50)))
-        sched._cache_probe_seqs.append(("req-b", array("i", STORED)))
-        sched._cache_probe_seqs.append(("req-c", array("i", A[:60] + [8] * 100)))
+        _ref(sched, "req-a", [7] * 50)
+        _ref(sched, "req-b", STORED)
+        _ref(sched, "req-c", A[:60] + [8] * 100)
         req = _request(PROMPT)
         with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
             sched._maybe_splice_prompt_to_stored(req)
@@ -281,14 +295,16 @@ class TestMaybeSplicePrompt:
 
     def test_newest_conversation_entry_is_used(self, caplog):
         # Turn 3: both stored turns tie at p0 = 100 (the turn-1 split), but
-        # only the turn-2 entry also covers the turn-2 output.
+        # only the turn-2 entry also covers the turn-2 output. Registering
+        # req-2 would supersede req-1, so both are placed directly (as two
+        # references sharing a prefix can be, e.g. a regenerated turn).
         e = list(range(6000, 6030))
         s1 = A + [10, 11] + B
         s2 = s1 + C + [22, 23] + D
         prompt = A + [12] + B + C + [20, 21] + D + e
         sched = _make_scheduler(block_size=64)
-        sched._cache_probe_seqs.append(("req-1", array("i", s1)))
-        sched._cache_probe_seqs.append(("req-2", array("i", s2)))
+        sched._splice_refs["req-1"] = array("i", s1)
+        sched._splice_refs["req-2"] = array("i", s2)
         req = _request(prompt)
         with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
             sched._maybe_splice_prompt_to_stored(req)
@@ -299,8 +315,9 @@ class TestMaybeSplicePrompt:
 
     def test_ties_pick_newest(self, caplog):
         sched = _make_scheduler(block_size=64)
-        sched._cache_probe_seqs.append(("req-x", array("i", STORED)))
-        sched._cache_probe_seqs.append(("req-y", array("i", STORED)))
+        # Placed directly: registering req-y would supersede req-x.
+        sched._splice_refs["req-x"] = array("i", STORED)
+        sched._splice_refs["req-y"] = array("i", STORED)
         req = _request(PROMPT)
         with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
             sched._maybe_splice_prompt_to_stored(req)
@@ -310,7 +327,7 @@ class TestMaybeSplicePrompt:
     def test_many_historical_divergences_still_splice(self):
         # 70 re-aligned splits, cumulative growth 70: no fixed cap may stop it.
         sched = _make_scheduler(block_size=64)
-        sched._cache_probe_seqs.append(("req-old", array("i", STORED_MANY)))
+        _ref(sched, "req-old", STORED_MANY)
         req = _request(PROMPT_MANY)
         sched._maybe_splice_prompt_to_stored(req)
         assert req.prompt_token_ids == STORED_MANY + C
@@ -319,7 +336,7 @@ class TestMaybeSplicePrompt:
     def test_no_block_gained_is_noop(self, caplog):
         # Aligned 152 of 193 stored tokens: floor(152/2048) == floor(100/2048).
         sched = _make_scheduler(block_size=2048)
-        sched._cache_probe_seqs.append(("req-old", array("i", STORED_2)))
+        _ref(sched, "req-old", STORED_2)
         req = _request(PROMPT_2)
         with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
             sched._maybe_splice_prompt_to_stored(req)
@@ -329,14 +346,14 @@ class TestMaybeSplicePrompt:
     def test_trailing_partial_block_is_not_counted(self):
         # Stored ends at 112 (aligned 112): floor(112/64) == floor(100/64).
         sched = _make_scheduler(block_size=64)
-        sched._cache_probe_seqs.append(("req-old", array("i", A + [10, 11] + B[:10])))
+        _ref(sched, "req-old", A + [10, 11] + B[:10])
         req = _request(PROMPT)
         sched._maybe_splice_prompt_to_stored(req)
         _assert_untouched(req, PROMPT)
 
     def test_partial_alignment_with_block_gain_splices(self):
         sched = _make_scheduler(block_size=64)
-        sched._cache_probe_seqs.append(("req-old", array("i", STORED_2)))
+        _ref(sched, "req-old", STORED_2)
         req = _request(PROMPT_2)
         sched._maybe_splice_prompt_to_stored(req)
         assert req.prompt_token_ids == A + [10, 11] + B + [20] + D + C
@@ -345,7 +362,7 @@ class TestMaybeSplicePrompt:
         # 182 = 2 * 91: the fetch would cover the whole spliced prompt, and an
         # exact hit makes stateful caches re-prefill, so it is not applied.
         sched = _make_scheduler(block_size=91)
-        sched._cache_probe_seqs.append(("req-old", array("i", SPLICED)))
+        _ref(sched, "req-old", SPLICED)
         req = _request(PROMPT)
         sched._maybe_splice_prompt_to_stored(req)
         _assert_untouched(req, PROMPT)
@@ -354,7 +371,7 @@ class TestMaybeSplicePrompt:
         # Retry of a stored prompt: the fetch covers 128 of 182 tokens, so a
         # suffix stays to prefill and the splice is applied.
         sched = _make_scheduler(block_size=64)
-        sched._cache_probe_seqs.append(("req-old", array("i", SPLICED)))
+        _ref(sched, "req-old", SPLICED)
         req = _request(PROMPT)
         sched._maybe_splice_prompt_to_stored(req)
         assert req.prompt_token_ids == SPLICED
@@ -365,7 +382,7 @@ class TestMaybeSplicePrompt:
     def test_env_opt_out(self, monkeypatch):
         monkeypatch.setenv("OMLX_DISABLE_SAMPLED_SPLICE", "1")
         sched = _make_scheduler(block_size=64)
-        sched._cache_probe_seqs.append(("req-old", array("i", STORED)))
+        _ref(sched, "req-old", STORED)
         req = _request(PROMPT)
         sched._maybe_splice_prompt_to_stored(req)
         _assert_untouched(req, PROMPT)
@@ -388,7 +405,7 @@ class TestMaybeSplicePrompt:
     )
     def test_guarded_request_fields_are_noop(self, field, value):
         sched = _make_scheduler(block_size=64)
-        sched._cache_probe_seqs.append(("req-old", array("i", STORED)))
+        _ref(sched, "req-old", STORED)
         req = _request(PROMPT, **{field: value})
         sched._maybe_splice_prompt_to_stored(req)
         _assert_untouched(req, PROMPT)
@@ -396,7 +413,7 @@ class TestMaybeSplicePrompt:
     def test_no_block_aware_cache_is_noop(self):
         sched = _make_scheduler(block_size=64)
         sched.block_aware_cache = None
-        sched._cache_probe_seqs.append(("req-old", array("i", STORED)))
+        _ref(sched, "req-old", STORED)
         req = _request(PROMPT)
         sched._maybe_splice_prompt_to_stored(req)
         _assert_untouched(req, PROMPT)
@@ -404,7 +421,7 @@ class TestMaybeSplicePrompt:
     def test_unreconstructible_cache_is_noop(self):
         sched = _make_scheduler(block_size=64)
         sched._unreconstructible_cache_model = True
-        sched._cache_probe_seqs.append(("req-old", array("i", STORED)))
+        _ref(sched, "req-old", STORED)
         req = _request(PROMPT)
         sched._maybe_splice_prompt_to_stored(req)
         _assert_untouched(req, PROMPT)
@@ -412,17 +429,17 @@ class TestMaybeSplicePrompt:
     def test_tokenizer_without_decode_is_noop(self):
         sched = _make_scheduler(block_size=64)
         sched.tokenizer = SimpleNamespace(encode=lambda text, **kw: [])
-        sched._cache_probe_seqs.append(("req-old", array("i", STORED)))
+        _ref(sched, "req-old", STORED)
         req = _request(PROMPT)
         sched._maybe_splice_prompt_to_stored(req)
         _assert_untouched(req, PROMPT)
 
-    def test_missing_or_empty_probe_is_noop(self):
+    def test_missing_or_empty_reference_store_is_noop(self):
         sched = _make_scheduler(block_size=64)
         req = _request(PROMPT)
         sched._maybe_splice_prompt_to_stored(req)  # empty deque
         _assert_untouched(req, PROMPT)
-        del sched._cache_probe_seqs  # scheduler built without the probe
+        del sched._splice_refs  # scheduler built without the reference store
         sched._maybe_splice_prompt_to_stored(req)
         _assert_untouched(req, PROMPT)
 
@@ -442,7 +459,7 @@ def _make_admission_scheduler(encode_map=None):
 class TestAddRequestSplice:
     def test_list_prompt_spliced_before_generation_prompt_is_resolved(self):
         sched = _make_admission_scheduler(encode_map={"<GEN>": GEN})
-        sched._cache_probe_seqs.append(("req-old", array("i", STORED)))
+        _ref(sched, "req-old", STORED)
         req = Request(
             request_id="req-new",
             prompt=PROMPT + GEN,
@@ -461,7 +478,7 @@ class TestAddRequestSplice:
 
     def test_string_prompt_spliced(self):
         sched = _make_admission_scheduler(encode_map={"TEXT": PROMPT})
-        sched._cache_probe_seqs.append(("req-old", array("i", STORED)))
+        _ref(sched, "req-old", STORED)
         req = Request(
             request_id="req-new", prompt="TEXT", sampling_params=SamplingParams()
         )
@@ -473,7 +490,7 @@ class TestAddRequestSplice:
 
     def test_only_requests_tokenized_here_are_spliced(self):
         sched = _make_admission_scheduler()
-        sched._cache_probe_seqs.append(("req-old", array("i", STORED)))
+        _ref(sched, "req-old", STORED)
         fresh = Request(
             request_id="req-fresh",
             prompt=list(PROMPT),
@@ -491,3 +508,224 @@ class TestAddRequestSplice:
         assert fresh.prompt_token_ids == SPLICED
         assert pre.prompt_token_ids == PROMPT
         assert pre.num_prompt_tokens == len(PROMPT)
+
+
+def _ref_dir(ssd_dir, model_name="test-model"):
+    model_key = hashlib.sha256(model_name.encode()).hexdigest()[:16]
+    return ssd_dir / "splice_refs" / model_key
+
+
+def _ref_file(ssd_dir, request_id, model_name="test-model"):
+    name = hashlib.sha256(request_id.encode()).hexdigest()[:32] + ".i32"
+    return _ref_dir(ssd_dir, model_name) / name
+
+
+def _unrelated(k):
+    return list(range(7000 + 100 * k, 7050 + 100 * k))
+
+
+def _make_drain_scheduler(**kwargs):
+    sched = _make_scheduler(**kwargs)
+    sched._pending_async_removes = deque()
+    sched.uid_to_request_id = {}
+    sched.request_id_to_uid = {}
+    sched._inflight_store_futures = {}
+    sched._inflight_store_info = {}
+    sched._boundary_snapshot_store = None
+    sched._store_cache_gate = None
+    sched.requests = {}
+    sched._clear_request_admission_bookkeeping = lambda request_id: None
+    sched._schedule_deferred_metal_clear = lambda: None
+    return sched
+
+
+def _done_future(result=None, exc=None):
+    future = concurrent.futures.Future()
+    if exc is not None:
+        future.set_exception(exc)
+    else:
+        future.set_result(result)
+    return future
+
+
+class TestSpliceReferenceStore:
+    def test_unrelated_completions_do_not_evict_conversation_ref(self, caplog):
+        sched = _make_scheduler(block_size=64)
+        _ref(sched, "req-conv", STORED)
+        for k in range(20):
+            _ref(sched, f"req-side-{k}", _unrelated(k))
+        req = _request(PROMPT)
+        with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+            sched._maybe_splice_prompt_to_stored(req)
+        assert req.prompt_token_ids == SPLICED
+        assert "with stored req-conv" in caplog.text
+
+    def test_newer_turn_supersedes_older_ref(self, tmp_path):
+        s1 = A + [10, 11] + B
+        s2 = s1 + C + [22, 23] + D
+        sched = _make_scheduler(block_size=64, ssd_dir=tmp_path)
+        _ref(sched, "req-1", s1)
+        sched._persist_splice_ref("req-1")
+        assert _ref_file(tmp_path, "req-1").exists()
+        _ref(sched, "req-side", _unrelated(0))
+        _ref(sched, "req-2", s2)
+        assert list(sched._splice_refs) == ["req-side", "req-2"]
+        assert list(sched._splice_refs["req-2"]) == s2
+        assert not _ref_file(tmp_path, "req-1").exists()
+
+    def test_diverging_ref_does_not_supersede(self):
+        sched = _make_scheduler(block_size=64)
+        _ref(sched, "req-1", STORED)
+        _ref(sched, "req-2", A + [15] + B)  # same prefix, then diverges
+        assert list(sched._splice_refs) == ["req-1", "req-2"]
+
+    def test_using_a_ref_moves_it_to_most_recent(self):
+        sched = _make_scheduler(block_size=64)
+        sched._SPLICE_REF_MAX_ENTRIES = 3
+        _ref(sched, "req-conv", STORED)
+        _ref(sched, "req-side-0", _unrelated(0))
+        _ref(sched, "req-side-1", _unrelated(1))
+        sched._maybe_splice_prompt_to_stored(_request(PROMPT))
+        _ref(sched, "req-side-2", _unrelated(2))  # evicts req-side-0, not conv
+        assert list(sched._splice_refs) == ["req-side-1", "req-conv", "req-side-2"]
+
+    def test_entry_cap_evicts_least_recent(self, tmp_path):
+        sched = _make_scheduler(block_size=64, ssd_dir=tmp_path)
+        sched._SPLICE_REF_MAX_ENTRIES = 3
+        for k in range(4):
+            _ref(sched, f"req-{k}", _unrelated(k))
+            sched._persist_splice_ref(f"req-{k}")
+        assert list(sched._splice_refs) == ["req-1", "req-2", "req-3"]
+        assert not _ref_file(tmp_path, "req-0").exists()
+        assert _ref_file(tmp_path, "req-3").exists()
+
+    def test_token_cap_evicts_least_recent(self):
+        sched = _make_scheduler(block_size=64)
+        sched._SPLICE_REF_MAX_TOKENS = 120
+        _ref(sched, "req-0", _unrelated(0))  # 50 tokens
+        _ref(sched, "req-1", _unrelated(1))  # 100
+        _ref(sched, "req-2", _unrelated(2))  # 150 > 120: req-0 goes
+        assert list(sched._splice_refs) == ["req-1", "req-2"]
+
+    def test_failed_store_drops_ref(self, tmp_path):
+        sched = _make_drain_scheduler(block_size=64, ssd_dir=tmp_path)
+        _ref(sched, "req-old", STORED)
+        sched._persist_splice_ref("req-old")
+        sched._pending_async_removes.append((0, "req-old", _done_future(False)))
+        sched._drain_pending_async_removes()
+        assert "req-old" not in sched._splice_refs
+        assert not _ref_file(tmp_path, "req-old").exists()
+        req = _request(PROMPT)
+        sched._maybe_splice_prompt_to_stored(req)
+        _assert_untouched(req, PROMPT)
+
+    def test_raised_store_drops_ref(self):
+        sched = _make_drain_scheduler(block_size=64)
+        _ref(sched, "req-old", STORED)
+        future = _done_future(exc=RuntimeError("boom"))
+        sched._pending_async_removes.append((0, "req-old", future))
+        sched._drain_pending_async_removes()
+        assert "req-old" not in sched._splice_refs
+
+    def test_successful_store_keeps_ref(self):
+        sched = _make_drain_scheduler(block_size=64)
+        _ref(sched, "req-old", STORED)
+        sched._pending_async_removes.append((0, "req-old", _done_future(True)))
+        sched._drain_pending_async_removes()
+        assert "req-old" in sched._splice_refs
+
+    def test_worker_reports_failure_and_does_not_persist(self, tmp_path):
+        sched = _make_scheduler(block_size=64, ssd_dir=tmp_path)
+        sched._stream = None
+        sched._phase_timer = lambda name: nullcontext()
+        sched.paged_cache_manager = None
+        sched.block_aware_cache = MagicMock()
+        sched.block_aware_cache.store_cache.side_effect = RuntimeError("disk")
+        _ref(sched, "req-old", STORED)
+        ok = sched._async_store_cache_worker(
+            "req-old", list(STORED), [], None, None, None, None, None
+        )
+        assert ok is False
+        assert not _ref_file(tmp_path, "req-old").exists()
+        sched.block_aware_cache.store_cache.side_effect = None
+        sched.block_aware_cache.store_cache.return_value = None
+        ok = sched._async_store_cache_worker(
+            "req-old", list(STORED), [], None, None, None, None, None
+        )
+        assert ok is True
+        assert _ref_file(tmp_path, "req-old").exists()
+
+    def test_refs_survive_restart(self, tmp_path, caplog):
+        # Turn 2 was spliced and stored; the server restarts before turn 3.
+        e = list(range(6000, 6030))
+        s2 = A + [10, 11] + B + C + [22, 23] + D
+        before = _make_scheduler(block_size=64, ssd_dir=tmp_path)
+        _ref(before, "req-2", s2)
+        before._persist_splice_ref("req-2")
+
+        after = _make_scheduler(block_size=64, ssd_dir=tmp_path)
+        assert not after._splice_refs
+        prompt = A + [12] + B + C + [20, 21] + D + e
+        req = _request(prompt)
+        with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+            after._maybe_splice_prompt_to_stored(req)
+        assert req.prompt_token_ids == s2 + e
+        assert f"matchable prefix 100 -> {len(s2)}" in caplog.text
+
+    def test_restart_load_applies_supersede_and_caps(self, tmp_path):
+        before = _make_scheduler(block_size=64, ssd_dir=tmp_path)
+        for k in range(3):
+            _ref(before, f"req-{k}", _unrelated(k))
+            before._persist_splice_ref(f"req-{k}")
+        after = _make_scheduler(block_size=64, ssd_dir=tmp_path)
+        after._SPLICE_REF_MAX_ENTRIES = 2
+        _ref(after, "req-new", _unrelated(0) + [5])  # supersedes loaded req-0
+        assert len(after._splice_refs) == 2
+        assert "req-new" in after._splice_refs
+        assert not _ref_file(tmp_path, "req-0").exists()
+        assert not _ref_file(tmp_path, "req-1").exists()
+        assert _ref_file(tmp_path, "req-2").exists()
+
+    def test_other_models_refs_are_not_loaded(self, tmp_path):
+        before = _make_scheduler(block_size=64, ssd_dir=tmp_path)
+        _ref(before, "req-old", STORED)
+        before._persist_splice_ref("req-old")
+        other = _make_scheduler(block_size=64, ssd_dir=tmp_path)
+        other.config.model_name = "other-model"
+        req = _request(PROMPT)
+        other._maybe_splice_prompt_to_stored(req)
+        _assert_untouched(req, PROMPT)
+        assert _ref_file(tmp_path, "req-old").exists()
+
+    def test_hot_cache_only_does_not_persist(self, tmp_path):
+        sched = _make_scheduler(block_size=64, ssd_dir=tmp_path)
+        sched.config.hot_cache_only = True
+        _ref(sched, "req-old", STORED)
+        sched._persist_splice_ref("req-old")
+        assert not (tmp_path / "splice_refs").exists()
+
+    def test_persistence_errors_are_ignored(self, tmp_path):
+        not_a_dir = tmp_path / "file"
+        not_a_dir.write_bytes(b"x")
+        sched = _make_scheduler(block_size=64, ssd_dir=not_a_dir)
+        _ref(sched, "req-old", STORED)
+        sched._persist_splice_ref("req-old")  # mkdir fails: no raise
+        sched._drop_splice_ref("req-old")
+        _ref(sched, "req-old", STORED)
+        req = _request(PROMPT)
+        sched._maybe_splice_prompt_to_stored(req)
+        assert req.prompt_token_ids == SPLICED  # in-memory ref still works
+
+    def test_garbage_files_are_ignored(self, tmp_path):
+        ref_dir = _ref_dir(tmp_path)
+        ref_dir.mkdir(parents=True)
+        odd = ref_dir / ("0" * 32 + ".i32")
+        odd.write_bytes(b"\x01\x02\x03")
+        junk = ref_dir / ("1" * 32 + ".i32")
+        junk.write_bytes(array("i", [123456] * 200).tobytes())
+        (ref_dir / ("2" * 32 + ".i32")).mkdir()  # unreadable entry
+        sched = _make_scheduler(block_size=64, ssd_dir=tmp_path)
+        req = _request(PROMPT)
+        sched._maybe_splice_prompt_to_stored(req)
+        _assert_untouched(req, PROMPT)
+        assert not odd.exists()
