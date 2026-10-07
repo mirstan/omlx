@@ -9640,11 +9640,11 @@ class Scheduler:
         text with different ids, put the stored ids back so the lookup can
         match the stored KV; the decoded prompt text is unchanged. A
         registered reference does not prove its KV is retrievable, so the
-        request keeps an undo record (``_splice_undo``) and
-        ``_prepare_prefix_cache_for_request`` reverts the splice when the
-        lookup reuses nothing past the first divergence. A spliced
-        conversation's later turns re-splice all earlier splits against its
-        newest stored sequence. ``OMLX_DISABLE_SAMPLED_SPLICE=1`` turns this
+        request keeps an undo record (``_splice_undo``) until it finishes,
+        and ``_revert_unbacked_splice`` reverts the splice when the cache
+        reused for its prefill stops at or before the first divergence. A
+        spliced conversation's later turns re-splice all earlier splits
+        against its newest stored sequence. ``OMLX_DISABLE_SAMPLED_SPLICE=1`` turns this
         off.
         """
         if os.environ.get("OMLX_DISABLE_SAMPLED_SPLICE") == "1":
@@ -10070,33 +10070,40 @@ class Scheduler:
         self._unreconstructible_cache_model = result
         return result
 
-    def _revert_unbacked_splice(self, request: Request, block_table, remaining):
-        """Undo a prompt splice the prefix-cache lookup did not back.
+    def _revert_unbacked_splice(self, request: Request, cached_tokens: int) -> bool:
+        """Undo a prompt splice the reused cache does not back.
 
-        Returns the lookup's remaining tokens, recomputed against the
-        restored prompt when the splice is reverted. A lookup that stops at
-        or before the first divergence reused only tokens both prompts share,
-        so the spliced ids bought nothing and the canonical ids are kept.
+        ``cached_tokens`` is the final count of prompt tokens reused from the
+        cache. KV that stops at or before the first divergence covers only
+        tokens both prompts share, so the spliced ids bought nothing: restore
+        the canonical prompt and set ``remaining_tokens`` to its uncached
+        suffix. Returns True when it reverted. Idempotent; a missing or
+        malformed ``_splice_undo`` is ignored.
         """
         undo = getattr(request, "_splice_undo", None)
-        if undo is None:
-            return remaining
-        request._splice_undo = None
+        if not (
+            isinstance(undo, tuple)
+            and len(undo) == 2
+            and isinstance(undo[0], list)
+            and isinstance(undo[1], int)
+        ):
+            return False
         original_prompt, p0 = undo
-        cached = block_table.num_tokens if block_table else 0
-        if cached > p0:
-            return remaining
+        if cached_tokens > p0 or cached_tokens >= len(original_prompt):
+            return False
+        request._splice_undo = None
         request.prompt_token_ids = original_prompt
         request.num_prompt_tokens = len(original_prompt)
         request.generation_prompt_start = 0
         self._resolve_generation_prompt_start(request)
+        request.remaining_tokens = original_prompt[cached_tokens:]
         logger.info(
             "prefix splice: request %s reverted (cached %d <= first divergence %d)",
             request.request_id,
-            cached,
+            cached_tokens,
             p0,
         )
-        return original_prompt[cached:]
+        return True
 
     def _prepare_prefix_cache_for_request(self, request: Request) -> None:
         if request.request_id in self._prefix_cache_prepared:
@@ -10127,7 +10134,6 @@ class Scheduler:
                     extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
                 )
             fetch_ms = (time.perf_counter() - fetch_started) * 1000.0
-            remaining = self._revert_unbacked_splice(request, block_table, remaining)
             # A split GDN sidecar represents state at a full block boundary.
             # Exact-hit generation needs N-1 state, which Arrays/GDN cannot
             # produce by trimming one token. Re-prefill only the final block.
@@ -10299,6 +10305,9 @@ class Scheduler:
                     )
             else:
                 request.remaining_tokens = request.prompt_token_ids
+            # Decide on the reuse that survived reconstruction and the
+            # exact-hit and minimum-prefix fallbacks, not on the lookup.
+            self._revert_unbacked_splice(request, request.cached_tokens)
         else:
             # No paged SSD cache configured - process all tokens. The splice
             # no-ops here, so this only keeps an undo record from leaking.
@@ -10375,7 +10384,8 @@ class Scheduler:
             request.num_prompt_tokens = len(request.prompt_token_ids)
             # Put sampled ids back where the prompt re-sends stored output
             # as text, so the prefix cache can match past the re-tokenization
-            # (the lookup reverts a splice the cache does not back).
+            # (``_revert_unbacked_splice`` reverts a splice the cache does not
+            # back).
             # Runs before the generation prompt is located: that lookup is
             # end-relative and the splice never rewrites the prompt's tail.
             self._maybe_splice_prompt_to_stored(request)
@@ -11331,6 +11341,7 @@ class Scheduler:
         request = self.requests.get(request_id)
         if request is None:
             return False
+        request._splice_undo = None
 
         # A finished request remains in self.requests while its async
         # store_cache worker owns boundary snapshots and cache buffers. Do not
@@ -12311,17 +12322,9 @@ class Scheduler:
 
             # Validate cache before using it
             if cache_to_use is not None and not self._validate_cache(cache_to_use):
-                logger.debug(
-                    f"Request {request.request_id}: invalid cache detected, "
-                    f"proceeding without cache"
-                )
                 cache_to_use = None
-                request.prompt_cache = None
-                request.cached_tokens = 0
-                request.remaining_tokens = request.prompt_token_ids
+                self._reject_invalid_prompt_cache(request)
                 tokens_to_process = request.prompt_token_ids
-                # Indices were scored against the rejected cache's cached_tokens.
-                request.specprefill_indices = None
 
             # SpecPrefill requests must be alone in the batch (RoPE patching
             # affects the entire model). Also block scheduling if another
@@ -13304,6 +13307,10 @@ class Scheduler:
             self._throttle_notified_requests.discard(rid)
 
         for request_id in finished_ids:
+            finished_request = self.requests.get(request_id)
+            if finished_request is not None:
+                # Finished with the splice kept: nothing will re-prefill it.
+                finished_request._splice_undo = None
             _mtp_priming.release_request(self.model, request_id)
             finished_drafter = _block_drafter_for(self.model)
             if finished_drafter is not None:
@@ -13863,6 +13870,19 @@ class Scheduler:
 
         logger.info("Generation overflow recovery completed")
 
+    def _reject_invalid_prompt_cache(self, request: Request) -> None:
+        """Drop a reconstructed cache that failed validation; prefill cold."""
+        logger.debug(
+            f"Request {request.request_id}: invalid cache detected, "
+            f"proceeding without cache"
+        )
+        request.prompt_cache = None
+        request.cached_tokens = 0
+        request.remaining_tokens = request.prompt_token_ids
+        self._revert_unbacked_splice(request, 0)
+        # Indices were scored against the rejected cache's cached_tokens.
+        request.specprefill_indices = None
+
     def _reset_request_for_reprefill(self, request: Request) -> None:
         """Reset request-owned decode state so it can be prefilled again."""
         request.status = RequestStatus.WAITING
@@ -13870,6 +13890,7 @@ class Scheduler:
         request.prompt_cache = None
         request.cached_tokens = 0
         request.remaining_tokens = request.prompt_token_ids
+        self._revert_unbacked_splice(request, 0)
         request.block_table = None
         request.shared_prefix_blocks = 0
         request.output_token_ids = []
@@ -14125,6 +14146,8 @@ class Scheduler:
         request.prompt_cache = None
         request.cached_tokens = 0
         request.remaining_tokens = request.prompt_token_ids
+        # Unbound: tests drive this helper with a stand-in ``self``.
+        Scheduler._revert_unbacked_splice(self, request, 0)
         request.block_table = None
         request.shared_prefix_blocks = 0
         request.output_token_ids = []

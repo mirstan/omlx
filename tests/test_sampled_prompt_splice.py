@@ -514,8 +514,10 @@ class TestAddRequestSplice:
 class _FetchCache:
     """Fake block-aware cache whose lookup reuses ``num_tokens`` tokens."""
 
-    def __init__(self, num_tokens):
+    def __init__(self, num_tokens, reconstruct=True, truncate_to=None):
         self.num_tokens = num_tokens
+        self.reconstruct = reconstruct
+        self.truncate_to = truncate_to
 
     def fetch_cache(self, request_id, tokens, **kwargs):
         if self.num_tokens is None:
@@ -527,10 +529,13 @@ class _FetchCache:
         return table, list(tokens[self.num_tokens :])
 
     def reconstruct_cache(self, block_table, **kwargs):
-        return [object()]
+        if self.truncate_to is not None:
+            block_table.num_tokens = self.truncate_to
+            block_table.block_ids = block_table.block_ids[: self.truncate_to // 64]
+        return [object()] if self.reconstruct else None
 
 
-def _make_lookup_scheduler(num_tokens):
+def _make_lookup_scheduler(num_tokens, **cache_kwargs):
     """Admission scheduler that runs the whole prefix-cache lookup.
 
     Helpers after the fetch that need a real model or cache are stubbed:
@@ -538,7 +543,7 @@ def _make_lookup_scheduler(num_tokens):
     probe and no SpecPrefill.
     """
     sched = _make_admission_scheduler(encode_map={"<GEN>": GEN})
-    sched.block_aware_cache = _FetchCache(num_tokens)
+    sched.block_aware_cache = _FetchCache(num_tokens, **cache_kwargs)
     sched.paged_cache_manager = None
     sched.model = SimpleNamespace()
     sched._prefix_cache_prepared = set()
@@ -606,7 +611,8 @@ class TestLookupRevertsUnbackedSplice:
         assert req.num_prompt_tokens == len(SPLICED + GEN)
         assert req.generation_prompt_start == len(SPLICED)
         assert req.remaining_tokens == (SPLICED + GEN)[128:]
-        assert getattr(req, "_splice_undo", None) is None
+        # Kept until the request finishes: a later cache drop still reverts.
+        assert req._splice_undo == (PROMPT + GEN, len(A))
         assert not any("reverted" in r.getMessage() for r in caplog.records)
 
     def test_unspliced_request_is_untouched(self, caplog):
@@ -647,6 +653,157 @@ class TestLookupRevertsUnbackedSplice:
         sched._prepare_prefix_cache_for_request(req)
 
         _assert_canonical(req, 0)
+
+    def test_failed_reconstruct_after_backed_lookup_reverts(self):
+        sched = _make_lookup_scheduler(128, reconstruct=False)
+        req = _spliced_request(sched)
+
+        sched._prepare_prefix_cache_for_request(req)
+
+        _assert_canonical(req, 0)
+        assert req.cached_tokens == 0
+
+    @pytest.mark.parametrize("truncate_to", [64, 0])
+    def test_reconstruct_truncated_to_divergence_reverts(self, truncate_to):
+        sched = _make_lookup_scheduler(128, truncate_to=truncate_to)
+        req = _spliced_request(sched)
+
+        sched._prepare_prefix_cache_for_request(req)
+
+        _assert_canonical(req, truncate_to)
+
+    def test_reconstruct_truncated_past_divergence_keeps_splice(self):
+        sched = _make_lookup_scheduler(192, truncate_to=128)
+        req = _spliced_request(sched)
+
+        sched._prepare_prefix_cache_for_request(req)
+
+        assert req.prompt_token_ids == SPLICED + GEN
+        assert req.cached_tokens == 128
+        assert req.remaining_tokens == (SPLICED + GEN)[128:]
+        assert req._splice_undo == (PROMPT + GEN, len(A))
+
+    def test_revert_is_idempotent(self):
+        sched = _make_lookup_scheduler(128)
+        req = _spliced_request(sched)
+
+        assert sched._revert_unbacked_splice(req, 0) is True
+        assert sched._revert_unbacked_splice(req, 0) is False
+
+        _assert_canonical(req, 0)
+
+    def test_rejected_cache_after_kept_splice_reverts(self):
+        sched = _make_lookup_scheduler(128)
+        req = _spliced_request(sched)
+        sched._prepare_prefix_cache_for_request(req)
+        req.specprefill_indices = object()
+
+        sched._reject_invalid_prompt_cache(req)
+
+        _assert_canonical(req, 0)
+        assert req.prompt_cache is None
+        assert req.cached_tokens == 0
+        assert req.specprefill_indices is None
+
+    def test_reprefill_after_kept_splice_reverts(self):
+        sched = _make_lookup_scheduler(128)
+        req = _spliced_request(sched)
+        sched._prepare_prefix_cache_for_request(req)
+        req.output_token_ids = [7, 8]
+
+        sched._reset_request_for_reprefill(req)
+
+        _assert_canonical(req, 0)
+        assert req.output_token_ids == []
+
+    def test_oom_requeue_after_kept_splice_reverts(self):
+        sched = _make_lookup_scheduler(128)
+        req = _spliced_request(sched)
+        sched._prepare_prefix_cache_for_request(req)
+        sched._specprefill_active_request_id = None
+        sched._reclaim_prefill_headroom = lambda: 0
+
+        assert sched._requeue_or_fail_prefill(
+            req, RuntimeError("Memory limit exceeded")
+        )
+
+        _assert_canonical(req, 0)
+        assert sched.waiting[0] is req
+
+    def test_corruption_reschedule_after_kept_splice_reverts(self):
+        sched = _make_lookup_scheduler(128)
+        req = _spliced_request(sched)
+        sched._prepare_prefix_cache_for_request(req)
+        sched.requests = {req.request_id: req}
+        sched.running = {req.request_id: req}
+        sched.prefilling = deque()
+        sched._inflight_store_futures = {}
+        sched._prefill_states = {}
+
+        assert sched._reschedule_running_requests(is_corruption=True) == []
+
+        _assert_canonical(req, 0)
+        assert sched.waiting[0] is req
+
+    @pytest.mark.parametrize(
+        "undo", ["not-set", None, (), ([1, 2], "3"), ((1, 2), 3), ([1], 2, 3)]
+    )
+    def test_foreign_undo_value_is_ignored(self, undo):
+        sched = _make_lookup_scheduler(128)
+        req = MagicMock()
+        req.prompt_token_ids = list(SPLICED)
+        if undo != "not-set":
+            req._splice_undo = undo
+
+        assert sched._revert_unbacked_splice(req, 0) is False
+        sched._reset_request_for_reprefill(req)
+
+        assert req.prompt_token_ids == SPLICED
+
+    def test_magicmock_request_lookup_does_not_crash(self):
+        sched = _make_lookup_scheduler(128)
+        req = MagicMock()
+        req.request_id = "req-mock"
+        req.prompt_token_ids = list(SPLICED)
+        req.vlm_extra_keys_for_cache = None
+        req.vlm_extra_key_token_start_for_cache = None
+        req.vlm_extra_key_ranges_for_cache = None
+
+        sched._prepare_prefix_cache_for_request(req)
+
+        assert req.prompt_token_ids == SPLICED
+        assert req.cached_tokens == 128
+
+
+class TestSpliceRecordClearedOnFinish:
+    def _scheduler(self, mock_model, mock_tokenizer):
+        sched = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        sched.block_aware_cache = None
+        sched.paged_cache_manager = None
+        req = _request(SPLICED, request_id="req-done")
+        req._splice_undo = (list(PROMPT), len(A))
+        sched.requests[req.request_id] = req
+        sched.running[req.request_id] = req
+        return sched, req
+
+    def test_finished_request_drops_record_and_keeps_splice(
+        self, mock_model, mock_tokenizer
+    ):
+        sched, req = self._scheduler(mock_model, mock_tokenizer)
+
+        sched._cleanup_finished({req.request_id})
+
+        assert req._splice_undo is None
+        assert req.prompt_token_ids == SPLICED
+
+    def test_aborted_request_drops_record(self, mock_model, mock_tokenizer):
+        sched, req = self._scheduler(mock_model, mock_tokenizer)
+
+        with patch("omlx.scheduler.mx"):
+            assert sched._do_abort_request(req.request_id) is True
+
+        assert req._splice_undo is None
+        assert req.prompt_token_ids == SPLICED
 
 
 def _ref_dir(ssd_dir, model_name="test-model"):
