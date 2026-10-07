@@ -2614,9 +2614,11 @@ class Scheduler:
     ) -> bool:
         """Run store_cache + paged_cache cleanup off the inference thread.
 
-        Returns False when the store raised (it is logged, not re-raised),
-        True otherwise. On success the request's splice reference is
-        persisted and supersedes older turns (_persist_splice_ref).
+        Returns False when the store raised (it is logged, not re-raised)
+        or store_cache returned None (it refused the store without raising,
+        so no cache backs the reference), True otherwise. Only on success is
+        the request's splice reference persisted, superseding older turns
+        (_persist_splice_ref).
 
         Pre-conditions enforced by the caller (_cleanup_finished):
         - mx.eval() (a FULL, blocking eval — NOT async_eval) was called on
@@ -2688,6 +2690,7 @@ class Scheduler:
                         hot_cache_write_back=False,
                         _store_tail_terminal=store_tail_terminal,
                     )
+            stored = block_table is not None
             if block_table is None and self.paged_cache_manager is not None:
                 block_table = self.paged_cache_manager.get_block_table(request_id)
             if block_table and self.paged_cache_manager is not None:
@@ -2696,6 +2699,8 @@ class Scheduler:
                 self.block_aware_cache.clear_request_entry(request_id)
         except Exception as e:
             logger.warning("Async store_cache failed for %s: %s", request_id, e)
+            return False
+        if not stored:
             return False
         try:
             self._persist_splice_ref(request_id)
@@ -9399,13 +9404,20 @@ class Scheduler:
             with suppress(OSError):
                 tmp.unlink(missing_ok=True)
 
-    def clear_splice_refs(self) -> int:
-        """Forget every splice reference, in memory and on disk.
+    def clear_splice_refs(self, *, delete_files: bool = True) -> int:
+        """Forget every splice reference. Returns the number removed.
 
-        The hook for paths that clear the prefix cache: a reference must not
-        outlive the cache it points at. Deletes this model's reference files
-        (best effort) and marks the store loaded so a later lazy load cannot
-        bring them back. Returns the number of references removed.
+        With ``delete_files`` (the default) this is the full clear, the hook
+        for paths that wipe the SSD cache: a reference must not outlive the
+        cache it points at. It deletes this model's reference files (best
+        effort) and marks the store loaded so a later lazy load cannot bring
+        them back.
+
+        ``delete_files=False`` is the in-memory reset that reset() uses. The
+        SSD cache outlives reset() and shutdown() (graceful stop, unload,
+        ownership transfer) for reuse on reload, so the files are kept and
+        the store is marked unloaded: a reused scheduler reloads them lazily.
+        The count is then the in-memory references only.
         """
         lock = getattr(self, "_splice_refs_lock", None)
         if lock is None or getattr(self, "_splice_refs", None) is None:
@@ -9418,7 +9430,9 @@ class Scheduler:
             names = getattr(self, "_splice_ref_names", None)
             if names is not None:
                 names.clear()
-            self._splice_refs_loaded = True
+            self._splice_refs_loaded = delete_files
+            if not delete_files:
+                return removed
             directory = self._splice_ref_dir()
             if directory is None:
                 return removed
@@ -14535,7 +14549,9 @@ class Scheduler:
         # Clear caches
         if self.block_aware_cache is not None:
             self.block_aware_cache.clear()
-        self.clear_splice_refs()
+        # In memory only: the SSD cache the reference files point at outlives
+        # reset (shutdown keeps it for reuse on reload), so they must too.
+        self.clear_splice_refs(delete_files=False)
         self._cache_rate_tracker.clear()
         self._boundary_snapshot_diagnostics.clear()
         self._last_prefix_cache_lookup = None

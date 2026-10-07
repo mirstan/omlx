@@ -555,8 +555,13 @@ def _make_worker_scheduler(ssd_dir=None):
     sched._phase_timer = lambda name: nullcontext()
     sched.paged_cache_manager = None
     sched.block_aware_cache = MagicMock()
-    sched.block_aware_cache.store_cache.return_value = None
+    sched.block_aware_cache.store_cache.return_value = _stored_table()
     return sched
+
+
+def _stored_table():
+    """What a successful store_cache returns (a BlockTable stand-in)."""
+    return SimpleNamespace(block_ids=[1, 2])
 
 
 def _store(sched, request_id, seq):
@@ -700,12 +705,37 @@ class TestSpliceReferenceStore:
         assert ok is False
         assert not _ref_file(tmp_path, "req-old").exists()
         sched.block_aware_cache.store_cache.side_effect = None
-        sched.block_aware_cache.store_cache.return_value = None
+        sched.block_aware_cache.store_cache.return_value = _stored_table()
         ok = sched._async_store_cache_worker(
             "req-old", list(STORED), [], None, None, None, None, None
         )
         assert ok is True
         assert _ref_file(tmp_path, "req-old").exists()
+
+    def test_store_returning_none_fails_and_keeps_predecessor(self, tmp_path):
+        # store_cache refuses some stores without raising (a partial
+        # CacheList composite): no cache, so no persist and no supersede.
+        s2 = STORED + C + [22, 23] + D
+        sched = _make_drain_scheduler(block_size=64, ssd_dir=tmp_path)
+        sched._stream = None
+        sched._phase_timer = lambda name: nullcontext()
+        sched.paged_cache_manager = None
+        sched.block_aware_cache = MagicMock()
+        sched.block_aware_cache.store_cache.return_value = _stored_table()
+        _ref(sched, "req-1", STORED)
+        assert _store(sched, "req-1", STORED) is True
+        _ref(sched, "req-2", s2)
+        sched.block_aware_cache.store_cache.return_value = None
+        ok = _store(sched, "req-2", s2)
+        assert ok is False
+        assert not _ref_file(tmp_path, "req-2").exists()
+        assert list(sched._splice_refs) == ["req-1", "req-2"]
+        assert _ref_file(tmp_path, "req-1").exists()
+        sched.block_aware_cache.clear_request_entry.assert_called_with("req-2")
+        sched._pending_async_removes.append((0, "req-2", _done_future(ok)))
+        sched._drain_pending_async_removes()
+        assert list(sched._splice_refs) == ["req-1"]
+        assert _ref_file(tmp_path, "req-1").exists()
 
     def test_refs_survive_restart(self, tmp_path, caplog):
         # Turn 2 was spliced and stored; the server restarts before turn 3.
@@ -823,7 +853,7 @@ def test_submit_failure_drops_ref(mock_model, mock_tokenizer):
 
 
 class TestClearSpliceRefs:
-    def test_reset_clears_splice_refs(self, tmp_path):
+    def test_clear_removes_refs_in_memory_and_on_disk(self, tmp_path):
         sched = _make_scheduler(block_size=64, ssd_dir=tmp_path)
         _ref(sched, "req-1", STORED)
         sched._persist_splice_ref("req-1")
@@ -860,8 +890,56 @@ class TestClearSpliceRefs:
         assert sched.clear_splice_refs() == 1
         assert not sched._splice_refs
 
-    def test_reset_calls_clear_splice_refs(self):
+    def test_in_memory_clear_keeps_files_and_reloads(self, tmp_path):
+        sched = _make_scheduler(block_size=64, ssd_dir=tmp_path)
+        _ref(sched, "req-1", STORED)
+        sched._persist_splice_ref("req-1")
+        assert sched.clear_splice_refs(delete_files=False) == 1
+        assert not sched._splice_refs
+        assert _ref_file(tmp_path, "req-1").exists()
+        req = _request(PROMPT)
+        sched._maybe_splice_prompt_to_stored(req)
+        assert req.prompt_token_ids == SPLICED
+
+    @pytest.mark.parametrize("method", ["reset", "deep_reset"])
+    def test_graceful_reset_keeps_refs_on_disk(
+        self, tmp_path, caplog, mock_model, mock_tokenizer, method
+    ):
+        # Graceful stop, unload and ownership transfer all reach reset();
+        # the SSD KV outlives them, so the references must too.
+        sched = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=64),
+        )
+        sched.config.paged_ssd_cache_dir = str(tmp_path)
+        sched.config.model_name = "test-model"
+        _ref(sched, "req-1", STORED)
+        sched._persist_splice_ref("req-1")
+        assert _ref_file(tmp_path, "req-1").exists()
+        getattr(sched, method)()
+        assert not sched._splice_refs
+        assert sched._splice_refs_loaded is False
+        assert _ref_file(tmp_path, "req-1").exists()
+
+        if method == "reset":
+            # The same scheduler, reused after reset, reloads lazily.
+            sched.tokenizer = _PieceTokenizer()
+            sched.block_aware_cache = object()
+            req = _request(PROMPT)
+            sched._maybe_splice_prompt_to_stored(req)
+            assert req.prompt_token_ids == SPLICED
+
+        # A fresh scheduler on the same directory (a reload) splices too.
+        fresh = _make_scheduler(block_size=64, ssd_dir=tmp_path)
+        req = _request(PROMPT)
+        with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
+            fresh._maybe_splice_prompt_to_stored(req)
+        assert req.prompt_token_ids == SPLICED
+        assert "prefix splice" in caplog.text
+
+    def test_reset_clears_refs_in_memory_only(self):
         sched = MagicMock()
         with patch("omlx.scheduler._mtp_priming"):
             Scheduler.reset(sched)
-        sched.clear_splice_refs.assert_called_once_with()
+        sched.clear_splice_refs.assert_called_once_with(delete_files=False)
