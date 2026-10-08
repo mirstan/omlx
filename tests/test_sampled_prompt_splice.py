@@ -75,7 +75,7 @@ PROMPT_2 = A + [12] + B + [20] + D + C
 STORED_M = A + [10, 11] + B + [22, 23] + D  # two re-alignable divergences
 PROMPT_M = A + [12] + B + [20, 21] + D + C
 
-# 70 historical splits (more than the old 64 cap), each growing the prompt by 1.
+# 70 historical splits, each growing the prompt by 1.
 SEGS = [list(range(5000 + 3 * k, 5003 + 3 * k)) for k in range(70)]
 STORED_MANY = A + [t for s in SEGS for t in [10, 11] + s]
 PROMPT_MANY = A + [t for s in SEGS for t in [12] + s] + C
@@ -438,7 +438,7 @@ class TestMaybeSplicePrompt:
     def test_missing_or_empty_reference_store_is_noop(self):
         sched = _make_scheduler(block_size=64)
         req = _request(PROMPT)
-        sched._maybe_splice_prompt_to_stored(req)  # empty deque
+        sched._maybe_splice_prompt_to_stored(req)  # empty reference store
         _assert_untouched(req, PROMPT)
         del sched._splice_refs  # scheduler built without the reference store
         sched._maybe_splice_prompt_to_stored(req)

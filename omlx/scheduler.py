@@ -2195,8 +2195,7 @@ class Scheduler:
         # stored cache sequences, so a miss can be traced to the exact
         # token where the new prompt diverges from what was cached.
         # Always maintained (int32 arrays, maxlen=_CACHE_PROBE_MAXLEN) so
-        # large re-prefills can log their divergence point at INFO (#2333)
-        # and re-sent sampled output can be spliced back (add_request).
+        # large re-prefills can log their divergence point at INFO (#2333).
         self._cache_probe_seqs: deque[tuple[str, array | list[int]]] = deque(
             maxlen=self._CACHE_PROBE_MAXLEN
         )
@@ -9208,7 +9207,7 @@ class Scheduler:
     _SPLICE_WINDOW = 8  # max tokens on either side of one re-aligned divergence
     # Re-aligned divergences per request. A spliced conversation re-splices
     # every historical split on each later turn, so this must cover a whole
-    # conversation's history, not one output (~50-100 us per divergence).
+    # conversation's history, not one output.
     _SPLICE_MAX_DIVERGENCES = 1024
     _SPLICE_CONTEXT_TOKENS = 4  # shared tokens decoded on each side of a window
     _SPLICE_CONTEXT_WIDEN = 4  # extra context tried until the decode is clean
@@ -9283,7 +9282,7 @@ class Scheduler:
         """Load persisted references once per scheduler. Caller holds the lock.
 
         Files are loaded oldest first, so the newest end up most recent.
-        Unreadable and malformed files are skipped and deleted when possible.
+        Unreadable files are skipped; malformed ones are deleted when possible.
         """
         if getattr(self, "_splice_refs_loaded", False):
             return
@@ -9329,8 +9328,8 @@ class Scheduler:
     def _register_splice_ref(self, request_id: str, seq: array) -> None:
         """Record a sequence about to be submitted to store_cache.
 
-        Older references are left alone until the store succeeds: the store
-        worker then persists this one and drops the references it supersedes
+        Does not supersede anything itself: the store worker drops the
+        references this one supersedes only once the store succeeds
         (_persist_splice_ref).
         """
         lock = getattr(self, "_splice_refs_lock", None)
@@ -9376,7 +9375,7 @@ class Scheduler:
         evicted meanwhile leaves no file behind. Only after that replace
         (or, without persistence, right away) does the reference supersede
         the older references that are a prefix of it, so a store that fails
-        never costs the conversation its previous reference.
+        never supersedes the conversation's previous reference.
         """
         lock = getattr(self, "_splice_refs_lock", None)
         if lock is None:
@@ -9407,11 +9406,10 @@ class Scheduler:
     def clear_splice_refs(self, *, delete_files: bool = True) -> int:
         """Forget every splice reference. Returns the number removed.
 
-        With ``delete_files`` (the default) this is the full clear, the hook
-        for paths that wipe the SSD cache: a reference must not outlive the
-        cache it points at. It deletes this model's reference files (best
-        effort) and marks the store loaded so a later lazy load cannot bring
-        them back.
+        With ``delete_files`` (the default) it also deletes this model's
+        reference files (best effort) and marks the store loaded, so a later
+        lazy load cannot bring them back; a reference must not outlive the
+        cache it points at.
 
         ``delete_files=False`` is the in-memory reset that reset() uses. The
         SSD cache outlives reset() and shutdown() (graceful stop, unload,
@@ -9635,8 +9633,9 @@ class Scheduler:
         next turn re-sends that output as text, and the tokenizer may split
         it differently (a non-canonical BPE split), so the prefix cache stops
         at the first block holding such a split. Where the prompt and a
-        splice reference (``_splice_refs``, one stored sequence per
-        conversation, kept across restarts with the SSD cache) spell the same
+        splice reference (``_splice_refs``, stored sequences in which a
+        successful store supersedes the earlier turns it extends, kept across
+        restarts with the SSD cache) spell the same
         text with different ids, put the stored ids back so the lookup can
         match the stored KV; the decoded prompt text is unchanged. A
         registered reference does not prove its KV is retrievable, so the
@@ -10396,10 +10395,6 @@ class Scheduler:
             else:
                 request.prompt_token_ids = list(request.prompt)
             request.num_prompt_tokens = len(request.prompt_token_ids)
-            # Put sampled ids back where the prompt re-sends stored output
-            # as text, so the prefix cache can match past the re-tokenization
-            # (``_revert_unbacked_splice`` reverts a splice the cache does not
-            # back).
             # Runs before the generation prompt is located: that lookup is
             # end-relative and the splice never rewrites the prompt's tail.
             self._maybe_splice_prompt_to_stored(request)
